@@ -114,7 +114,7 @@ public class JsonFileMetricsReporter implements CodahaleReporter, Runnable {
     if (!metricsDir.toFile().exists()) {
       LOGGER.warn("Metrics directory {} does not exist, creating one", metricsDir);
       try {
-        // createDirectories creates all non-existent parent directories
+        // createDirectories creates all nonexistent parent directories
         Files.createDirectories(metricsDir, DIR_ATTRS);
       } catch (IOException e) {
         LOGGER.error("Failed to create directory {}: {}", metricsDir, e.getMessage());
@@ -159,7 +159,7 @@ public class JsonFileMetricsReporter implements CodahaleReporter, Runnable {
         return;
       } catch (UnsupportedOperationException e) {
         // This shouldn't ever happen
-        LOGGER.error("failed to create temp file for JSON metrics: operartion not supported", e);
+        LOGGER.error("failed to create temp file for JSON metrics: operation not supported", e);
         return;
       }
 
@@ -179,7 +179,7 @@ public class JsonFileMetricsReporter implements CodahaleReporter, Runnable {
         LOGGER.error("Exception during rename", e);
       }
     } catch (Throwable t) {
-      // catch all errors (throwable and execptions to prevent subsequent tasks from being suppressed)
+      // catch all errors (throwable and exceptions to prevent subsequent tasks from being suppressed)
       LOGGER.error("Error executing scheduled task ", t);
     } finally {
       // If something happened and we were not able to rename the temp file, attempt to remove it
