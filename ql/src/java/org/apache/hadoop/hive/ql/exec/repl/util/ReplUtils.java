@@ -17,6 +17,10 @@
  */
 package org.apache.hadoop.hive.ql.exec.repl.util;
 
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.JsonSerializer;
+import com.fasterxml.jackson.databind.SerializerProvider;
+
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -64,7 +68,9 @@ import org.apache.hadoop.hive.ql.parse.repl.dump.metric.BootstrapDumpMetricColle
 import org.apache.hadoop.hive.ql.parse.repl.dump.metric.IncrementalDumpMetricCollector;
 import org.apache.hadoop.hive.ql.parse.repl.load.metric.BootstrapLoadMetricCollector;
 import org.apache.hadoop.hive.ql.parse.repl.load.metric.IncrementalLoadMetricCollector;
+import org.apache.hadoop.hive.ql.parse.repl.load.metric.PreOptimizedBootstrapLoadMetricCollector;
 import org.apache.hadoop.hive.ql.parse.repl.metric.ReplicationMetricCollector;
+import org.apache.hadoop.hive.ql.parse.repl.metric.event.Metadata;
 import org.apache.hadoop.hive.ql.parse.repl.metric.event.Status;
 import org.apache.hadoop.hive.ql.plan.ColumnStatsUpdateWork;
 import org.apache.hadoop.hive.ql.plan.ExprNodeColumnDesc;
@@ -82,6 +88,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -153,6 +160,8 @@ public class ReplUtils {
 
   // Service name for atlas.
   public static final String REPL_ATLAS_SERVICE = "atlas";
+  public static final String INC_EVENTS_BATCH = "events_batch_%d";
+
   /**
    * Bootstrap REPL LOAD operation type on the examined object based on ckpt state.
    */
@@ -527,11 +536,20 @@ public class ReplUtils {
     }
   }
 
+  /**
+   * Used to report status of replication stage which is skipped or has some error
+   * @param stageName Name of replication stage
+   * @param status Status skipped or FAILED etc
+   * @param errorLogPath path of error log file
+   * @param conf handle configuration parameter
+   * @param dbName name of database
+   * @param replicationType type of replication incremental, bootstrap, etc
+   * @throws SemanticException
+   */
   public static void reportStatusInReplicationMetrics(String stageName, Status status, String errorLogPath,
-                                                      HiveConf conf)
+                                                      HiveConf conf, String dbName, Metadata.ReplicationType replicationType)
           throws SemanticException {
-    ReplicationMetricCollector metricCollector =
-            new ReplicationMetricCollector(null, null, null, 0, conf) {};
+    ReplicationMetricCollector metricCollector = new ReplicationMetricCollector(dbName, replicationType, null, 0, conf) {};
     metricCollector.reportStageStart(stageName, new HashMap<>());
     metricCollector.reportStageEnd(stageName, status, errorLogPath);
   }
@@ -544,5 +562,12 @@ public class ReplUtils {
   // True if REPL DUMP should do transaction optimization
   public static boolean filterTransactionOperations(HiveConf conf) {
     return (conf.getBoolVar(HiveConf.ConfVars.REPL_FILTER_TRANSACTIONS));
+  }
+  public  static class TimeSerializer extends JsonSerializer<Long> {
+
+    @Override
+    public void serialize(Long epoch, JsonGenerator jsonGenerator, SerializerProvider serializerProvider) throws IOException {
+      jsonGenerator.writeString(Instant.ofEpochSecond(epoch).toString());
+    }
   }
 }

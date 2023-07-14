@@ -116,6 +116,12 @@ import org.slf4j.LoggerFactory;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 
+import static org.apache.hadoop.hive.conf.HiveConf.ConfVars.HIVE_LOAD_DATA_USE_NATIVE_API;
+import static org.apache.hadoop.hive.ql.parse.PTFInvocationSpec.NullOrder.NULLS_FIRST;
+import static org.apache.hadoop.hive.ql.parse.PTFInvocationSpec.NullOrder.NULLS_LAST;
+import static org.apache.hadoop.hive.ql.parse.PTFInvocationSpec.Order.ASC;
+import static org.apache.hadoop.hive.ql.parse.PTFInvocationSpec.Order.DESC;
+
 /**
  * BaseSemanticAnalyzer.
  *
@@ -136,6 +142,9 @@ public abstract class BaseSemanticAnalyzer {
   protected Map<String, String> idToTableNameMap;
   protected QueryProperties queryProperties;
   ParseContext pCtx = null;
+
+  //user defined functions in query
+  protected Set<String> userSuppliedFunctions;
 
   /**
    * A set of FileSinkOperators being written to in an ACID compliant way.  We need to remember
@@ -281,6 +290,7 @@ public abstract class BaseSemanticAnalyzer {
       inputs = new LinkedHashSet<ReadEntity>();
       outputs = new LinkedHashSet<WriteEntity>();
       txnManager = queryState.getTxnManager();
+      userSuppliedFunctions = new HashSet<>();
     } catch (Exception e) {
       throw new SemanticException(e);
     }
@@ -425,16 +435,16 @@ public abstract class BaseSemanticAnalyzer {
       // table node
       Map.Entry<String,String> dbTablePair = getDbTableNamePair(tableOrColumnNode);
       String tableName = dbTablePair.getValue();
-      String metaTable = null;
+      String tableMetaRef = null;
       if (tableName.contains(".")) {
         String[] tmpNames = tableName.split("\\.");
         tableName = tmpNames[0];
-        metaTable = tmpNames[1];
+        tableMetaRef = tmpNames[1];
       }
       return TableName.fromString(tableName,
           null,
           dbTablePair.getKey() == null ? currentDatabase : dbTablePair.getKey(),
-          metaTable)
+          tableMetaRef)
           .getNotEmptyDbTable();
     } else if (tokenType == HiveParser.StringLiteral) {
       return unescapeSQLString(tableOrColumnNode.getText());
@@ -471,8 +481,8 @@ public abstract class BaseSemanticAnalyzer {
     if (tabNameNode.getChildCount() == 3) {
       final String dbName = unescapeIdentifier(tabNameNode.getChild(0).getText());
       final String tableName = unescapeIdentifier(tabNameNode.getChild(1).getText());
-      final String metaTableName = unescapeIdentifier(tabNameNode.getChild(2).getText());
-      return HiveTableName.fromString(tableName, catalogName, dbName, metaTableName);
+      final String tableMetaRef = unescapeIdentifier(tabNameNode.getChild(2).getText());
+      return HiveTableName.fromString(tableName, catalogName, dbName, tableMetaRef);
     }
 
     if (tabNameNode.getChildCount() == 2) {
@@ -563,6 +573,7 @@ public abstract class BaseSemanticAnalyzer {
     int ssampleIndex = -1;
     int asOfTimeIndex = -1;
     int asOfVersionIndex = -1;
+    int asOfVersionFromIndex = -1;
     for (int index = 1; index < tabref.getChildCount(); index++) {
       ASTNode ct = (ASTNode) tabref.getChild(index);
       if (ct.getToken().getType() == HiveParser.TOK_TABLEBUCKETSAMPLE) {
@@ -575,11 +586,14 @@ public abstract class BaseSemanticAnalyzer {
         asOfTimeIndex = index;
       } else if (ct.getToken().getType() == HiveParser.TOK_AS_OF_VERSION) {
         asOfVersionIndex = index;
+      } else if (ct.getToken().getType() == HiveParser.TOK_FROM_VERSION) {
+        asOfVersionFromIndex = index;
       } else {
         aliasIndex = index;
       }
     }
-    return new int[] {aliasIndex, propsIndex, tsampleIndex, ssampleIndex, asOfTimeIndex, asOfVersionIndex};
+    return new int[] {
+        aliasIndex, propsIndex, tsampleIndex, ssampleIndex, asOfTimeIndex, asOfVersionIndex, asOfVersionFromIndex};
   }
 
   /**
@@ -729,7 +743,7 @@ public abstract class BaseSemanticAnalyzer {
    * Escapes the string for AST; doesn't enclose it in quotes, however.
    */
   public static String escapeSQLString(String b) {
-    // There's usually nothing to escape so we will be optimistic.
+    // There's usually nothing to escape, so we will be optimistic.
     String result = b;
     for (int i = 0; i < result.length(); ++i) {
       char currentChar = result.charAt(i);
@@ -1202,6 +1216,9 @@ public abstract class BaseSemanticAnalyzer {
             ast.getChild(childIndex), e.getMessage()), e);
       }
 
+      boolean isUseNativeLoadApi = checkUseNativeApi(conf, ast);
+      allowDynamicPartitionsSpec &= !isUseNativeLoadApi;
+
       // get partition metadata if partition specified
       if (ast.getChildCount() == 2 && ast.getToken().getType() != HiveParser.TOK_CREATETABLE &&
           ast.getToken().getType() != HiveParser.TOK_CREATE_MATERIALIZED_VIEW &&
@@ -1226,6 +1243,12 @@ public abstract class BaseSemanticAnalyzer {
             val = stripQuotes(partspec_val.getChild(1).getText());
           }
           tmpPartSpec.put(colName, val);
+        }
+
+        // Return here in case of native load api, as for now the iceberg tables are considered unpartitioned in HMS
+        if (isUseNativeLoadApi) {
+          partSpec = tmpPartSpec;
+          return;
         }
 
         // check if the columns, as well as value types in the partition() clause are valid
@@ -1293,7 +1316,7 @@ public abstract class BaseSemanticAnalyzer {
           specType = SpecType.STATIC_PARTITION;
         }
       } else if(createDynPartSpec(ast) && allowDynamicPartitionsSpec) {
-        // if user hasn't specify partition spec generate it from table's partition spec
+        // if user hasn't specified partition spec generate it from table's partition spec
         // do this only if it is INSERT/INSERT INTO/INSERT OVERWRITE/ANALYZE
         List<FieldSchema> parts = tableHandle.getPartitionKeys();
         partSpec = new LinkedHashMap<String, String>(parts.size());
@@ -1306,6 +1329,11 @@ public abstract class BaseSemanticAnalyzer {
       } else {
         specType = SpecType.TABLE_ONLY;
       }
+    }
+
+    private boolean checkUseNativeApi(HiveConf conf, ASTNode ast) {
+      boolean isLoad = ast.getParent() != null && ast.getParent().getType() == HiveParser.TOK_LOAD;
+      return isLoad && tableHandle.isNonNative() && conf.getBoolVar(HIVE_LOAD_DATA_USE_NATIVE_API);
     }
 
     public TableName getTableName() {
@@ -1436,6 +1464,16 @@ public abstract class BaseSemanticAnalyzer {
 
   public void setUpdateColumnAccessInfo(ColumnAccessInfo updateColumnAccessInfo) {
     this.updateColumnAccessInfo = updateColumnAccessInfo;
+  }
+
+  /**
+   * Gets the user supplied functions.
+   * Note 1: This list only accumulates UDFs explicitly mentioned in the query
+   * Note 2: This list will not include UDFs defined with views/tables
+   * @return List of String with names of UDFs.
+   */
+  public Set<String> getUserSuppliedFunctions() {
+    return userSuppliedFunctions;
   }
 
   /**
@@ -1695,7 +1733,7 @@ public abstract class BaseSemanticAnalyzer {
           TypeInfoUtils.getStandardJavaObjectInspectorFromTypeInfo(expectedType);
       //  Since partVal is a constant, it is safe to cast ExprNodeDesc to ExprNodeConstantDesc.
       //  Its value should be in normalized format (e.g. no leading zero in integer, date is in
-      //  format of YYYY-MM-DD etc)
+      //  format of YYYY-MM-DD etc.)
       Object value = ((ExprNodeConstantDesc)astExprNodePair.getValue()).getValue();
       Object convertedValue = value;
       if (!inputOI.getTypeName().equals(outputOI.getTypeName())) {
@@ -1836,7 +1874,7 @@ public abstract class BaseSemanticAnalyzer {
   }
 
   protected Table getTable(TableName tn, boolean throwException) throws SemanticException {
-    return getTable(tn.getDb(), tn.getTable(), tn.getMetaTable(), throwException);
+    return getTable(tn.getDb(), tn.getTable(), tn.getTableMetaRef(), throwException);
   }
 
   protected Table getTable(String tblName) throws SemanticException {
@@ -1851,13 +1889,13 @@ public abstract class BaseSemanticAnalyzer {
     return getTable(database, tblName, null, throwException);
   }
 
-  protected Table getTable(String database, String tblName, String metaTableName, boolean throwException)
+  protected Table getTable(String database, String tblName, String tableMetaRef, boolean throwException)
       throws SemanticException {
     Table tab;
     try {
-      String tableName = metaTableName == null ? tblName : tblName + "." + metaTableName;
+      String tableName = tableMetaRef == null ? tblName : tblName + "." + tableMetaRef;
       tab = database == null ? db.getTable(tableName, false)
-          : db.getTable(database, tblName, metaTableName, false);
+          : db.getTable(database, tblName, tableMetaRef, false);
     }
     catch (InvalidTableException e) {
       throw new SemanticException(ErrorMsg.INVALID_TABLE.getMsg(TableName.fromString(tblName, null, database).getNotEmptyDbTable()), e);
@@ -1961,7 +1999,7 @@ public abstract class BaseSemanticAnalyzer {
   /**
    * Unparses the analyzed statement
    */
-  protected void executeUnparseTranlations() {
+  protected void executeUnParseTranslations() {
     UnparseTranslator unparseTranslator = new UnparseTranslator(conf);
     unparseTranslator.applyTranslations(ctx.getTokenRewriteStream());
   }
@@ -1982,6 +2020,29 @@ public abstract class BaseSemanticAnalyzer {
 
   public ParseContext getParseContext() {
     return pCtx;
+  }
+
+  public PTFInvocationSpec.OrderSpec processOrderSpec(ASTNode sortNode) {
+    PTFInvocationSpec.OrderSpec oSpec = new PTFInvocationSpec.OrderSpec();
+    int exprCnt = sortNode.getChildCount();
+    for (int i = 0; i < exprCnt; i++) {
+      PTFInvocationSpec.OrderExpression exprSpec = new PTFInvocationSpec.OrderExpression();
+      ASTNode orderSpec = (ASTNode) sortNode.getChild(i);
+      ASTNode nullOrderSpec = (ASTNode) orderSpec.getChild(0);
+      exprSpec.setExpression((ASTNode) nullOrderSpec.getChild(0));
+      if (orderSpec.getType() == HiveParser.TOK_TABSORTCOLNAMEASC) {
+        exprSpec.setOrder(ASC);
+      } else {
+        exprSpec.setOrder(DESC);
+      }
+      if (nullOrderSpec.getType() == HiveParser.TOK_NULLS_FIRST) {
+        exprSpec.setNullOrder(NULLS_FIRST);
+      } else {
+        exprSpec.setNullOrder(NULLS_LAST);
+      }
+      oSpec.addExpression(exprSpec);
+    }
+    return oSpec;
   }
 
 }

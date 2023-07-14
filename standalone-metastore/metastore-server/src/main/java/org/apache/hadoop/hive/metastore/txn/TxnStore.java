@@ -25,7 +25,10 @@ import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.hive.common.ValidTxnList;
 import org.apache.hadoop.hive.common.classification.RetrySemantics;
 import org.apache.hadoop.hive.metastore.api.AbortTxnRequest;
+import org.apache.hadoop.hive.metastore.api.NoSuchCompactionException;
 import org.apache.hadoop.hive.metastore.api.AbortTxnsRequest;
+import org.apache.hadoop.hive.metastore.api.AbortCompactResponse;
+import org.apache.hadoop.hive.metastore.api.AbortCompactionRequest;
 import org.apache.hadoop.hive.metastore.api.AddDynamicPartitions;
 import org.apache.hadoop.hive.metastore.api.AllocateTableWriteIdsRequest;
 import org.apache.hadoop.hive.metastore.api.AllocateTableWriteIdsResponse;
@@ -77,6 +80,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.Map;
 
 /**
  * A handler to answer transaction related calls that come into the metastore
@@ -91,6 +95,7 @@ public interface TxnStore extends Configurable {
   String TXN_KEY_START = "_meta";
 
 
+
   enum MUTEX_KEY {
     Initiator, Cleaner, HouseKeeper, TxnCleaner,
     CompactionScheduler, MaterializationRebuild
@@ -103,6 +108,23 @@ public interface TxnStore extends Configurable {
   String SUCCEEDED_RESPONSE = "succeeded";
   String DID_NOT_INITIATE_RESPONSE = "did not initiate";
   String REFUSED_RESPONSE = "refused";
+  String ABORTED_RESPONSE = "aborted";
+
+  char INITIATED_STATE = 'i';
+  char WORKING_STATE = 'w';
+  char READY_FOR_CLEANING = 'r';
+  char FAILED_STATE = 'f';
+  char SUCCEEDED_STATE = 's';
+  char DID_NOT_INITIATE = 'a';
+  char REFUSED_STATE = 'c';
+
+  char ABORTED_STATE = 'x';
+
+  // Compactor types
+  char MAJOR_TYPE = 'a';
+  char MINOR_TYPE = 'i';
+  char REBALANCE_TYPE = 'r';
+  char ABORT_TXN_CLEANUP_TYPE = 'c';
 
   String[] COMPACTION_STATES = new String[] {INITIATED_RESPONSE, WORKING_RESPONSE, CLEANING_RESPONSE, FAILED_RESPONSE,
       SUCCEEDED_RESPONSE, DID_NOT_INITIATE_RESPONSE, REFUSED_RESPONSE };
@@ -232,6 +254,9 @@ public interface TxnStore extends Configurable {
   GetValidWriteIdsResponse getValidWriteIds(GetValidWriteIdsRequest rqst)
           throws NoSuchTxnException,  MetaException;
 
+  @RetrySemantics.SafeToRetry
+  void addWriteIdsToMinHistory(long txnId, Map<String, Long> minOpenWriteIds) throws MetaException;
+
   /**
    * Allocate a write ID for the given table and associate it with a transaction
    * @param rqst info on transaction and table to allocate write id
@@ -357,6 +382,17 @@ public interface TxnStore extends Configurable {
   ShowCompactResponse showCompact(ShowCompactRequest rqst) throws MetaException;
 
   /**
+   * Abort (rollback) a compaction.
+   *
+   * @param rqst info on compaction to abort
+   * @return
+   * @throws NoSuchCompactionException
+   * @throws MetaException
+   */
+  @RetrySemantics.Idempotent
+  AbortCompactResponse abortCompactions(AbortCompactionRequest rqst) throws NoSuchCompactionException, MetaException;
+
+  /**
    * Get one latest record of SUCCEEDED or READY_FOR_CLEANING compaction for a table/partition.
    * No checking is done on the dbname, tablename, or partitionname to make sure they refer to valid objects.
    * Is is assumed to be done by the caller.
@@ -429,7 +465,7 @@ public interface TxnStore extends Configurable {
   Set<CompactionInfo> findPotentialCompactions(int abortedThreshold, long abortedTimeThreshold) throws MetaException;
 
   @RetrySemantics.ReadOnly
-  Set<CompactionInfo> findPotentialCompactions(int abortedThreshold, long abortedTimeThreshold, long checkInterval)
+  Set<CompactionInfo> findPotentialCompactions(int abortedThreshold, long abortedTimeThreshold, long lastChecked)
       throws MetaException;
 
   /**
@@ -481,6 +517,19 @@ public interface TxnStore extends Configurable {
   List<CompactionInfo> findReadyToClean(long minOpenTxnWaterMark, long retentionTime) throws MetaException;
 
   /**
+   * Find the aborted entries in TXN_COMPONENTS which can be used to
+   * clean directories belonging to transactions in aborted state.
+   * @param abortedTimeThreshold Age of table/partition's oldest aborted transaction involving a given table
+   *                            or partition that will trigger cleanup.
+   * @param abortedThreshold Number of aborted transactions involving a given table or partition
+   *                         that will trigger cleanup.
+   * @return Information of potential abort items that needs to be cleaned.
+   * @throws MetaException
+   */
+  @RetrySemantics.ReadOnly
+  List<CompactionInfo> findReadyToCleanAborts(long abortedTimeThreshold, int abortedThreshold) throws MetaException;
+
+  /**
    * Sets the cleaning start time for a particular compaction
    *
    * @param info info on the compaction entry
@@ -525,7 +574,7 @@ public interface TxnStore extends Configurable {
 
   /**
    * Stores the value of {@link CompactionInfo#retryRetention} and {@link CompactionInfo#errorMessage} fields
-   * of the CompactionInfo in the HMS database.
+   * of the CompactionInfo either by inserting or updating the fields in the HMS database.
    * @param info The {@link CompactionInfo} object holding the values.
    * @throws MetaException
    */

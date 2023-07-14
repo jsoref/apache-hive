@@ -28,11 +28,11 @@ import java.io.Serializable;
 import java.lang.annotation.Annotation;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -106,7 +106,7 @@ public class ExplainTask extends Task<ExplainWork> implements Serializable {
   private static final String CBO_INFO_JSON_LABEL = "cboInfo";
   private static final String CBO_PLAN_JSON_LABEL = "CBOPlan";
   private static final String CBO_PLAN_TEXT_LABEL = "CBO PLAN:";
-  private final Set<Operator<?>> visitedOps = new HashSet<Operator<?>>();
+  private final Map<Operator<?>, Integer> operatorVisits = new HashMap<>();
   private boolean isLogical = false;
 
   /*
@@ -455,7 +455,7 @@ public class ExplainTask extends Task<ExplainWork> implements Serializable {
   public void addCreateTableStatement(Table table, List<String> tableCreateStmt , DDLPlanUtils ddlPlanUtils) {
     tableCreateStmt.add(ddlPlanUtils.getCreateTableCommand(table, false) + ";");
   }
-  
+
   public void addPKandBasicStats(Table tbl, List<String> basicDef, DDLPlanUtils ddlPlanUtils){
     String primaryKeyStmt = ddlPlanUtils.getAlterTableStmtPrimaryKeyConstraint(tbl.getPrimaryKeyInfo());
     if (primaryKeyStmt != null) {
@@ -549,7 +549,7 @@ public class ExplainTask extends Task<ExplainWork> implements Serializable {
     try {
       Path resFile = work.getResFile();
       OutputStream outS = resFile.getFileSystem(conf).create(resFile);
-      out = new PrintStream(outS);
+      out = new PrintStream(outS, false, StandardCharsets.UTF_8.name());
 
       if(work.isDDL()){
         getDDLPlan(out);
@@ -793,7 +793,7 @@ public class ExplainTask extends Task<ExplainWork> implements Serializable {
   /**
    * Retruns a map which have either primitive or string keys.
    *
-   * This is neccessary to discard object level comparators which may sort the objects based on some non-trivial logic.
+   * This is necessary to discard object level comparators which may sort the objects based on some non-trivial logic.
    *
    * @param mp
    * @return
@@ -1003,6 +1003,12 @@ public class ExplainTask extends Task<ExplainWork> implements Serializable {
     if (work instanceof Operator) {
       Operator<? extends OperatorDesc> operator =
         (Operator<? extends OperatorDesc>) work;
+      final int visitCnt = operatorVisits.merge(operator, 1, Integer::sum);
+      final int limit = conf.getIntVar(ConfVars.HIVE_EXPLAIN_NODE_VISIT_LIMIT);
+      if (visitCnt == limit) {
+        throw new IllegalStateException(
+            operator + " reached " + ConfVars.HIVE_EXPLAIN_NODE_VISIT_LIMIT.varname + "(" + limit + ")");
+      }
       if (operator.getConf() != null) {
         String appender = isLogical ? " (" + operator.getOperatorId() + ")" : "";
         JSONObject jsonOut = outputPlan(operator.getConf(), out, extended,
@@ -1023,15 +1029,12 @@ public class ExplainTask extends Task<ExplainWork> implements Serializable {
         }
       }
 
-      if (!visitedOps.contains(operator) || !isLogical) {
-        visitedOps.add(operator);
-        if (operator.getChildOperators() != null) {
-          int cindent = jsonOutput ? 0 : indent + 2;
-          for (Operator<? extends OperatorDesc> op : operator.getChildOperators()) {
-            JSONObject jsonOut = outputPlan(op, out, extended, jsonOutput, cindent, "", inTest);
-            if (jsonOutput) {
-              ((JSONObject)json.get(JSONObject.getNames(json)[0])).accumulate("children", jsonOut);
-            }
+      if ((visitCnt == 1 || !isLogical) && operator.getChildOperators() != null) {
+        int cindent = jsonOutput ? 0 : indent + 2;
+        for (Operator<? extends OperatorDesc> op : operator.getChildOperators()) {
+          JSONObject jsonOut = outputPlan(op, out, extended, jsonOutput, cindent, "", inTest);
+          if (jsonOutput) {
+            ((JSONObject) json.get(JSONObject.getNames(json)[0])).accumulate("children", jsonOut);
           }
         }
       }

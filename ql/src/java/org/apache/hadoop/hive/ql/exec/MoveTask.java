@@ -37,6 +37,7 @@ import org.apache.hadoop.hive.metastore.utils.MetaStoreUtils;
 import org.apache.hadoop.hive.ql.ErrorMsg;
 import org.apache.hadoop.hive.ql.ddl.DDLUtils;
 import org.apache.hadoop.hive.ql.ddl.table.create.CreateTableDesc;
+import org.apache.hadoop.hive.ql.ddl.view.create.CreateMaterializedViewDesc;
 import org.apache.hadoop.hive.ql.exec.mr.MapRedTask;
 import org.apache.hadoop.hive.ql.exec.mr.MapredLocalTask;
 import org.apache.hadoop.hive.ql.exec.repl.util.ReplUtils;
@@ -61,6 +62,7 @@ import org.apache.hadoop.hive.ql.metadata.Table;
 import org.apache.hadoop.hive.ql.optimizer.physical.BucketingSortingCtx.BucketCol;
 import org.apache.hadoop.hive.ql.optimizer.physical.BucketingSortingCtx.SortCol;
 import org.apache.hadoop.hive.ql.parse.ExplainConfiguration.AnalyzeState;
+import org.apache.hadoop.hive.ql.parse.SemanticException;
 import org.apache.hadoop.hive.ql.plan.DynamicPartitionCtx;
 import org.apache.hadoop.hive.ql.plan.LoadFileDesc;
 import org.apache.hadoop.hive.ql.plan.LoadMultiFilesDesc;
@@ -347,6 +349,12 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
 
   @Override
   public int execute() {
+    try {
+      initializeFromDeferredContext();
+    } catch (HiveException he) {
+      return processHiveException(he);
+    }
+
     if (Utilities.FILE_OP_LOGGER.isTraceEnabled()) {
       Utilities.FILE_OP_LOGGER.trace("Executing MoveWork " + System.identityHashCode(work)
         + " with " + work.getLoadFileWork() + "; " + work.getLoadTableWork() + "; "
@@ -381,12 +389,16 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
             FileSystem srcFs = sourcePath.getFileSystem(conf);
             FileStatus[] srcs = srcFs.globStatus(sourcePath);
             if(srcs != null) {
-              Hive.moveAcidFiles(srcFs, srcs, targetPath, null);
+              Hive.moveAcidFiles(srcFs, srcs, targetPath, null, conf);
             } else {
               LOG.debug("No files found to move from " + sourcePath + " to " + targetPath);
             }
           }
           else {
+            FileSystem targetFs = targetPath.getFileSystem(conf);
+            if (!targetFs.exists(targetPath.getParent())){
+              targetFs.mkdirs(targetPath.getParent());
+            }
             moveFile(sourcePath, targetPath, lfd.getIsDfsDir());
           }
         }
@@ -514,23 +526,7 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
 
       return 0;
     } catch (HiveException he) {
-      int errorCode = 1;
-
-      if (he.getCanonicalErrorMsg() != ErrorMsg.GENERIC_ERROR) {
-        errorCode = he.getCanonicalErrorMsg().getErrorCode();
-        if (he.getCanonicalErrorMsg() == ErrorMsg.UNRESOLVED_RT_EXCEPTION) {
-          console.printError("Failed with exception " + he.getMessage(), "\n"
-              + StringUtils.stringifyException(he));
-        } else {
-          console.printError("Failed with exception " + he.getMessage()
-              + "\nRemote Exception: " + he.getRemoteErrorMsg());
-          console.printInfo("\n", StringUtils.stringifyException(he),false);
-        }
-      }
-      setException(he);
-      errorCode = ReplUtils.handleException(work.isReplication(), he, work.getDumpDirectory(),
-                                            work.getMetricCollector(), getName(), conf);
-      return errorCode;
+      return processHiveException(he);
     } catch (Exception e) {
       console.printError("Failed with exception " + e.getMessage(), "\n"
           + StringUtils.stringifyException(e));
@@ -541,6 +537,31 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
     }
   }
 
+  private int processHiveException(HiveException he) {
+    int errorCode = 1;
+
+    if (he.getCanonicalErrorMsg() != ErrorMsg.GENERIC_ERROR) {
+      errorCode = he.getCanonicalErrorMsg().getErrorCode();
+      if (he.getCanonicalErrorMsg() == ErrorMsg.UNRESOLVED_RT_EXCEPTION) {
+        console.printError("Failed with exception " + he.getMessage(), "\n"
+            + StringUtils.stringifyException(he));
+      } else {
+        console.printError("Failed with exception " + he.getMessage()
+            + "\nRemote Exception: " + he.getRemoteErrorMsg());
+        console.printInfo("\n", StringUtils.stringifyException(he),false);
+      }
+    }
+    setException(he);
+    errorCode = ReplUtils.handleException(work.isReplication(), he, work.getDumpDirectory(),
+        work.getMetricCollector(), getName(), conf);
+    return errorCode;
+  }
+
+  private void initializeFromDeferredContext() throws HiveException {
+    if (null != getDeferredWorkContext()) {
+      work.initializeFromDeferredContext(getDeferredWorkContext());
+    }
+  }
   public void logMessage(LoadTableDesc tbd) {
     StringBuilder mesg = new StringBuilder("Loading data to table ")
         .append( tbd.getTable().getTableName());
@@ -1039,12 +1060,18 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
    * @return Returns <code>true</code> if the commit was successfully executed
    * @throws HiveException If we tried to commit, but there was an error during the process
    */
-  private static boolean checkAndCommitNatively(MoveWork moveWork, Configuration configuration) throws HiveException {
+  private boolean checkAndCommitNatively(MoveWork moveWork, Configuration configuration) throws HiveException {
     String storageHandlerClass = null;
     Properties commitProperties = null;
     boolean overwrite = false;
-
-    if (moveWork.getLoadTableWork() != null) {
+    LoadTableDesc loadTableWork = moveWork.getLoadTableWork();
+    if (loadTableWork != null) {
+      if (loadTableWork.isUseAppendForLoad()) {
+        loadTableWork.getMdTable().getStorageHandler()
+            .appendFiles(loadTableWork.getMdTable().getTTable(), loadTableWork.getSourcePath().toUri(),
+                loadTableWork.getLoadFileType() == LoadFileType.REPLACE_ALL, loadTableWork.getPartitionSpec());
+        return true;
+      }
       // Get the info from the table data
       TableDesc tableDesc = moveWork.getLoadTableWork().getTable();
       storageHandlerClass = tableDesc.getProperties().getProperty(
@@ -1054,10 +1081,23 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
     } else if (moveWork.getLoadFileWork() != null) {
       // Get the info from the create table data
       CreateTableDesc createTableDesc = moveWork.getLoadFileWork().getCtasCreateTableDesc();
+      String location = null;
       if (createTableDesc != null) {
         storageHandlerClass = createTableDesc.getStorageHandler();
         commitProperties = new Properties();
         commitProperties.put(hive_metastoreConstants.META_TABLE_NAME, createTableDesc.getDbTableName());
+        location = createTableDesc.getLocation();
+      } else {
+        CreateMaterializedViewDesc createViewDesc = moveWork.getLoadFileWork().getCreateViewDesc();
+        if (createViewDesc != null) {
+          storageHandlerClass = createViewDesc.getStorageHandler();
+          commitProperties = new Properties();
+          commitProperties.put(hive_metastoreConstants.META_TABLE_NAME, createViewDesc.getViewName());
+          location = createViewDesc.getLocation();
+        }
+      }
+      if (location != null) {
+        commitProperties.put(hive_metastoreConstants.META_TABLE_LOCATION, location);
       }
     }
 

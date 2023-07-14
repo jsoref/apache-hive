@@ -478,13 +478,14 @@ public enum ErrorMsg {
   DATACONNECTOR_NOT_EXISTS(10428, "Dataconnector does not exist:"),
   TIME_TRAVEL_NOT_ALLOWED(10429, "Time travel is not allowed for {0}. Please choose a storage format which supports the feature.", true),
   INVALID_METADATA_TABLE_NAME(10430, "Invalid metadata table name {0}.", true),
-  METADATA_TABLE_NOT_SUPPORTED(10431, "Metadata tables are not supported for table {0}.", true),
+  TABLE_META_REF_NOT_SUPPORTED(10431, "Table Meta Ref extension is not supported for table {0}.", true),
   COMPACTION_REFUSED(10432, "Compaction request for {0}.{1}{2} is refused, details: {3}.", true),
   CBO_IS_REQUIRED(10433,
           "The following functionality requires CBO (" + HiveConf.ConfVars.HIVE_CBO_ENABLED.varname + "): {0}", true),
   CTLF_UNSUPPORTED_FORMAT(10434, "CREATE TABLE LIKE FILE is not supported by the ''{0}'' file format", true),
   NON_NATIVE_ACID_UPDATE(10435, "Update and Merge into non-native ACID table is only supported when " +
           HiveConf.ConfVars.SPLIT_UPDATE.varname + " is true."),
+  READ_ONLY_DATABASE(10436, "Database {0} is read-only", true),
 
   //========================== 20000 range starts here ========================//
 
@@ -524,6 +525,7 @@ public enum ErrorMsg {
   CTLF_MISSING_STORAGE_FORMAT_DESCRIPTOR(20021, "Failed to find StorageFormatDescriptor for file format ''{0}''", true),
   PARQUET_FOOTER_ERROR(20022, "Failed to read parquet footer:"),
   PARQUET_UNHANDLED_TYPE(20023, "Unhandled type {0}", true),
+  ORC_FOOTER_ERROR(20024, "Failed to read orc footer:"),
 
   // An exception from runtime that will show the full stack to client
   UNRESOLVED_RT_EXCEPTION(29999, "Runtime Error: {0}", "58004", true),

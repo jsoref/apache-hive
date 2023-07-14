@@ -19,6 +19,8 @@
 package org.apache.hive.service.server;
 
 import com.google.common.base.Joiner;
+
+import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -40,6 +42,7 @@ import org.apache.commons.cli.Option;
 import org.apache.commons.cli.OptionBuilder;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
+import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.concurrent.BasicThreadFactory;
 import org.apache.curator.framework.CuratorFramework;
@@ -57,6 +60,7 @@ import org.apache.hadoop.hive.common.ServerUtils;
 import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
 import org.apache.hadoop.hive.common.ZKDeRegisterWatcher;
 import org.apache.hadoop.hive.common.ZooKeeperHiveHelper;
+import org.apache.hadoop.hive.conf.Constants;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
 import org.apache.hadoop.hive.conf.HiveServer2TransportMode;
@@ -100,6 +104,7 @@ import org.apache.hive.http.LlapServlet;
 import org.apache.hive.http.security.PamAuthenticator;
 import org.apache.hive.service.CompositeService;
 import org.apache.hive.service.ServiceException;
+import org.apache.hive.service.auth.AuthType;
 import org.apache.hive.service.auth.saml.HiveSaml2Client;
 import org.apache.hive.service.auth.saml.HiveSamlUtils;
 import org.apache.hive.service.cli.CLIService;
@@ -132,6 +137,8 @@ import com.google.common.collect.Lists;
 import com.google.common.util.concurrent.SettableFuture;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
+import javax.servlet.jsp.JspFactory;
+
 /**
  * HiveServer2.
  *
@@ -140,6 +147,7 @@ public class HiveServer2 extends CompositeService {
   private static final Logger LOG = LoggerFactory.getLogger(HiveServer2.class);
   public static final String INSTANCE_URI_CONFIG = "hive.server2.instance.uri";
   private static final int SHUTDOWN_TIME = 60;
+
   private static CountDownLatch zkDeleteSignal;
   private static volatile KeeperException.Code zkDeleteResultCode;
 
@@ -338,6 +346,10 @@ public class HiveServer2 extends CompositeService {
           LOG.info("Web UI is disabled since port is set to " + webUIPort);
         } else {
           LOG.info("Starting Web UI on port "+ webUIPort);
+          if (JspFactory.getDefaultFactory() == null) {
+            // Set the default JspFactory to avoid NPE while opening the home page
+            JspFactory.setDefaultFactory(new org.apache.jasper.runtime.JspFactoryImpl());
+          }
           HttpServer.Builder builder = new HttpServer.Builder("hiveserver2");
           builder.setPort(webUIPort).setConf(hiveConf);
           builder.setHost(webHost);
@@ -439,7 +451,10 @@ public class HiveServer2 extends CompositeService {
     }
 
     // Add a shutdown hook for catching SIGTERM & SIGINT
-    ShutdownHookManager.addShutdownHook(() -> graceful_stop());
+    long timeout = HiveConf.getTimeVar(getHiveConf(),
+        HiveConf.ConfVars.HIVE_SERVER2_GRACEFUL_STOP_TIMEOUT, TimeUnit.SECONDS);
+    // Extra time for releasing the resources if timeout sets to 0
+    ShutdownHookManager.addGracefulShutDownHook(() -> graceful_stop(),  timeout == 0 ? 30 : timeout);
   }
 
   private void logCompactionParameters(HiveConf hiveConf) {
@@ -482,14 +497,6 @@ public class HiveServer2 extends CompositeService {
       transportMode = hiveConf.getVar(HiveConf.ConfVars.HIVE_SERVER2_TRANSPORT_MODE);
     }
     if (transportMode != null && (transportMode.equalsIgnoreCase(HiveServer2TransportMode.all.toString()))) {
-      return true;
-    }
-    return false;
-  }
-
-  public static boolean isKerberosAuthMode(Configuration hiveConf) {
-    String authMode = hiveConf.get(ConfVars.HIVE_SERVER2_AUTHENTICATION.varname);
-    if (authMode != null && (authMode.equalsIgnoreCase("KERBEROS"))) {
       return true;
     }
     return false;
@@ -559,7 +566,7 @@ public class HiveServer2 extends CompositeService {
     // Auth specific confs
     confsToPublish.put(ConfVars.HIVE_SERVER2_AUTHENTICATION.varname,
         hiveConf.getVar(ConfVars.HIVE_SERVER2_AUTHENTICATION));
-    if (isKerberosAuthMode(hiveConf)) {
+    if (AuthType.isKerberosAuthMode(hiveConf)) {
       confsToPublish.put(ConfVars.HIVE_SERVER2_KERBEROS_PRINCIPAL.varname,
           hiveConf.getVar(ConfVars.HIVE_SERVER2_KERBEROS_PRINCIPAL));
     }
@@ -658,7 +665,7 @@ public class HiveServer2 extends CompositeService {
     if ((thriftCLIService == null) || (thriftCLIService.getServerIPAddress() == null)) {
       throw new Exception("Unable to get the server address; it hasn't been initialized yet.");
     }
-    return thriftCLIService.getServerIPAddress().getHostName() + ":"
+    return thriftCLIService.getServerIPAddress().getCanonicalHostName() + ":"
         + thriftCLIService.getPortNumber();
   }
 
@@ -666,7 +673,7 @@ public class HiveServer2 extends CompositeService {
     if ((thriftCLIService == null) || (thriftCLIService.getServerIPAddress() == null)) {
       throw new Exception("Unable to get the server address; it hasn't been initialized yet.");
     }
-    return thriftCLIService.getServerIPAddress().getHostName();
+    return thriftCLIService.getServerIPAddress().getCanonicalHostName();
   }
 
   @Override
@@ -912,15 +919,22 @@ public class HiveServer2 extends CompositeService {
         LOG.error("Error removing znode for this HiveServer2 instance from ZooKeeper.", e);
       }
     }
+    String pidDir = StringUtils.defaultIfEmpty(System.getenv("HIVESERVER2_PID_DIR"),
+        System.getenv("HIVE_CONF_DIR"));
+    if (StringUtils.isNotEmpty(pidDir)) {
+      File pidFile = new File(pidDir, "hiveserver2.pid");
+      LOG.info("Deleting the tmp HiveServer2 pid file: {}", pidFile);
+      FileUtils.deleteQuietly(pidFile);
+    }
     super.decommission();
   }
 
   public synchronized void graceful_stop() {
     try {
       decommission();
+      // Need 30s for stop() to release server's resources
       long maxTimeForWait = HiveConf.getTimeVar(getHiveConf(),
-          HiveConf.ConfVars.HIVE_SERVER2_GRACEFUL_STOP_TIMEOUT, TimeUnit.MILLISECONDS);
-
+          HiveConf.ConfVars.HIVE_SERVER2_GRACEFUL_STOP_TIMEOUT, TimeUnit.MILLISECONDS) - 30000;
       long timeout = maxTimeForWait, startTime = System.currentTimeMillis();
       try {
         // The service should be started before when reaches here, as decommissioning would throw
@@ -997,12 +1011,12 @@ public class HiveServer2 extends CompositeService {
     if (zKClientForPrivSync != null) {
       zKClientForPrivSync.close();
     }
-    if (hiveConf != null && HiveSamlUtils
-        .isSamlAuthMode(hiveConf.getVar(ConfVars.HIVE_SERVER2_AUTHENTICATION))) {
+    if (hiveConf != null && AuthType.isSamlAuthMode(hiveConf)) {
       // this is mostly for testing purposes to make sure that SAML client is
       // reinitialized after a HS2 is restarted.
       HiveSaml2Client.shutdown();
     }
+
   }
 
   private void shutdownExecutor(final ExecutorService leaderActionsExecutorService) {
@@ -1137,11 +1151,59 @@ public class HiveServer2 extends CompositeService {
   private void maybeStartCompactorThreads(HiveConf hiveConf) throws Exception {
     if (MetastoreConf.getVar(hiveConf, MetastoreConf.ConfVars.HIVE_METASTORE_RUNWORKER_IN).equals("hs2")) {
       int numWorkers = MetastoreConf.getIntVar(hiveConf, MetastoreConf.ConfVars.COMPACTOR_WORKER_THREADS);
-      for (int i = 0; i < numWorkers; i++) {
-        Worker w = new Worker();
-        CompactorThread.initializeAndStartThread(w, hiveConf);
+      List<Map.Entry<String, String>> entries = hiveConf.getMatchingEntries(Constants.COMPACTION_POOLS_PATTERN);
+
+      StringBuilder sb = new StringBuilder(2048);
+      sb.append("This HS2 instance will act as Compactor with the following worker pool configuration:\n");
+      sb.append("Global pool size: ").append(numWorkers).append("\n");
+
+      LOG.info("Initializing the compaction pools with using the global worker limit: {} ", numWorkers);
+      while (numWorkers > 0 && entries.size() > 0) {
+        Map.Entry<String, String> entry = entries.remove(0);
+        String poolName = entry.getValue();
+        int poolWorkers = hiveConf.getInt(entry.getKey(), 0);
+
+        if (poolWorkers == 0) {
+          LOG.warn("Compaction pool ({}) configured with zero workers. Skipping pool initialization", poolName);
+          sb.append("Pool not initialized, 0 size: ").append(poolName).append("\n");
+          continue;
+        }
+        if (poolWorkers > numWorkers) {
+          LOG.warn("Global worker pool exhausted, compaction pool ({}) will be configured with less workers than the " +
+              "required number. ({} -> {})", poolName, poolWorkers, numWorkers);
+          poolWorkers = numWorkers;
+        }
+
+        LOG.info("Initializing compaction pool ({}) with {} workers.", poolName, poolWorkers);
+        for (int i = 0; i < poolWorkers; i++) {
+          Worker w = new Worker();
+          w.setPoolName(poolName);
+          CompactorThread.initializeAndStartThread(w, hiveConf);
+          sb.append("Worker - Name: ").append(w.getName()).append(", Pool: ").append(poolName)
+              .append(", Priority: ").append(w.getPriority()).append("\n");
+        }
+        numWorkers -= poolWorkers;
       }
-      LOG.info("This HS2 instance will act as Compactor Worker with {} threads", numWorkers);
+
+      if (numWorkers == 0) {
+        LOG.warn("No default compaction pool configured, all non-labeled compaction requests will remain unprocessed!");
+        if (entries.size() > 0) {
+          for (Map.Entry<String, String> entry : entries) {
+            String poolName = entry.getValue();
+            LOG.warn("There are no available workers for the following compaction pool: {} ", poolName);
+            sb.append("Pool not initialized, no remaining free workers: ").append(poolName).append("\n");
+          }
+          sb.append("Pool not initialized, no remaining free workers: default\n");
+        }
+      } else {
+        LOG.info("Initializing default compaction pool with {} workers.", numWorkers);
+        for (int i = 0; i < numWorkers; i++) {
+          Worker w = new Worker();
+          CompactorThread.initializeAndStartThread(w, hiveConf);
+          sb.append("Worker - Name: ").append(w.getName()).append(", Pool: default, Priority: ").append(w.getPriority()).append("\n");
+        }
+      }
+      LOG.info(sb.toString());
     }
   }
 

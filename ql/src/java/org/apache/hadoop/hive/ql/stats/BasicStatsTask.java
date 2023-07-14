@@ -105,7 +105,7 @@ public class BasicStatsTask implements Serializable, IStatsProcessor {
 
     LOG.info("Executing stats task");
     table = tbl;
-    return aggregateStats(db);
+    return aggregateStats(db, tbl);
   }
 
   @Override
@@ -167,7 +167,7 @@ public class BasicStatsTask implements Serializable, IStatsProcessor {
       }
 
       // The collectable stats for the aggregator needs to be cleared.
-      // For eg. if a file is being loaded, the old number of rows are not valid
+      // For example, if a file is being loaded, the old number of rows are not valid
       // XXX: makes no sense for me... possibly not needed anymore
       if (work.isClearAggregatorStats()) {
         // we choose to keep the invalid stats and only change the setting.
@@ -264,7 +264,7 @@ public class BasicStatsTask implements Serializable, IStatsProcessor {
     }
   }
 
-  private int aggregateStats(Hive db) {
+  private int aggregateStats(Hive db, Table tbl) {
 
     StatsAggregator statsAggregator = null;
     int ret = 0;
@@ -313,6 +313,11 @@ public class BasicStatsTask implements Serializable, IStatsProcessor {
           console.printInfo("Table " + tableFullName + " stats: [" + toString(p.getPartParameters()) + ']');
         }
         LOG.info("Table " + tableFullName + " stats: [" + toString(p.getPartParameters()) + ']');
+
+        // The table object is assigned to the latest table object.
+        // So that it can be used by ColStatsProcessor.
+        // This is only required for unpartitioned tables.
+        tbl.setTTable(res.getTTable());
 
       } else {
         // Partitioned table:
@@ -492,7 +497,7 @@ public class BasicStatsTask implements Serializable, IStatsProcessor {
       if (!table.isPartitioned()) {
         return null;
       }
-      // get all partitions that matches with the partition spec
+      // get all partitions that match with the partition spec
       return tblSpec.partitions != null ? unmodifiableList(tblSpec.partitions) : emptyList();
     } else if (work.getLoadTableDesc() != null) {
 

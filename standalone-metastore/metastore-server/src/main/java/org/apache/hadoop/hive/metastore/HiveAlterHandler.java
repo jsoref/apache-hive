@@ -31,6 +31,7 @@ import org.apache.hadoop.hive.metastore.conf.MetastoreConf;
 import org.apache.hadoop.hive.metastore.events.AlterPartitionEvent;
 import org.apache.hadoop.hive.metastore.events.AlterTableEvent;
 import org.apache.hadoop.hive.metastore.messaging.EventMessage;
+import org.apache.hadoop.hive.metastore.model.MTable;
 import org.apache.hadoop.hive.metastore.utils.FileUtils;
 import org.apache.hadoop.hive.metastore.utils.MetaStoreServerUtils;
 import org.apache.hadoop.hive.metastore.utils.MetaStoreUtils;
@@ -57,6 +58,7 @@ import org.apache.hadoop.hive.metastore.api.Partition;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 
+import javax.jdo.Constants;
 import java.io.IOException;
 import java.net.URI;
 import java.util.ArrayList;
@@ -105,8 +107,8 @@ public class HiveAlterHandler implements AlterHandler {
       IHMSHandler handler, String writeIdList)
           throws InvalidOperationException, MetaException {
     catName = normalizeIdentifier(catName);
-    name = name.toLowerCase();
-    dbname = dbname.toLowerCase();
+    name = normalizeIdentifier(name);
+    dbname = normalizeIdentifier(dbname);
 
     final boolean cascade;
     final boolean replDataLocationChanged;
@@ -177,7 +179,17 @@ public class HiveAlterHandler implements AlterHandler {
         rename = true;
       }
 
-      msdb.openTransaction();
+      String expectedKey = environmentContext != null && environmentContext.getProperties() != null ?
+              environmentContext.getProperties().get(hive_metastoreConstants.EXPECTED_PARAMETER_KEY) : null;
+      String expectedValue = environmentContext != null && environmentContext.getProperties() != null ?
+              environmentContext.getProperties().get(hive_metastoreConstants.EXPECTED_PARAMETER_VALUE) : null;
+
+      if (expectedKey != null) {
+        // If we have to check the expected state of the table we have to prevent nonrepeatable reads.
+        msdb.openTransaction(Constants.TX_REPEATABLE_READ);
+      } else {
+        msdb.openTransaction();
+      }
       // get old table
       // Note: we don't verify stats here; it's done below in alterTableUpdateTableColumnStats.
       olddb = msdb.getDatabase(catName, dbname);
@@ -185,6 +197,12 @@ public class HiveAlterHandler implements AlterHandler {
       if (oldt == null) {
         throw new InvalidOperationException("table " +
             TableName.getQualified(catName, dbname, name) + " doesn't exist");
+      }
+
+      if (expectedKey != null && expectedValue != null
+              && !expectedValue.equals(oldt.getParameters().get(expectedKey))) {
+        throw new MetaException("The table has been modified. The parameter value for key '" + expectedKey + "' is '"
+                + oldt.getParameters().get(expectedKey) + "'. The expected was value was '" + expectedValue + "'");
       }
 
       validateTableChangesOnReplSource(olddb, oldt, newt, environmentContext);
@@ -235,8 +253,15 @@ public class HiveAlterHandler implements AlterHandler {
 
       boolean renamedTranslatedToExternalTable = rename && MetaStoreUtils.isTranslatedToExternalTable(oldt)
           && MetaStoreUtils.isTranslatedToExternalTable(newt);
-      if (replDataLocationChanged
-          || renamedManagedTable || renamedTranslatedToExternalTable) {
+
+      boolean isRenameIcebergTable =
+          rename && HiveMetaHook.ICEBERG.equalsIgnoreCase(newt.getParameters().get(HiveMetaHook.TABLE_TYPE));
+
+      List<ColumnStatistics> columnStatistics = getColumnStats(msdb, oldt);
+      columnStatistics = deleteTableColumnStats(msdb, oldt, newt, columnStatistics);
+
+      if (!isRenameIcebergTable &&
+          (replDataLocationChanged || renamedManagedTable || renamedTranslatedToExternalTable)) {
         srcPath = new Path(oldt.getSd().getLocation());
 
         if (replDataLocationChanged) {
@@ -267,7 +292,13 @@ public class HiveAlterHandler implements AlterHandler {
             // get new location
             assert(isReplicated == HMSHandler.isDbReplicationTarget(db));
             if (renamedTranslatedToExternalTable) {
-              destPath = new Path(newt.getSd().getLocation());
+              if (!tableInSpecifiedLoc) {
+                destPath = new Path(newt.getSd().getLocation());
+              } else {
+                Path databasePath = constructRenamedPath(wh.getDatabaseExternalPath(db), srcPath);
+                destPath = new Path(databasePath, newTblName);
+                newt.getSd().setLocation(destPath.toString());
+              }
             } else {
               Path databasePath = constructRenamedPath(wh.getDatabaseManagedPath(db), srcPath);
               destPath = new Path(databasePath, newTblName);
@@ -360,16 +391,17 @@ public class HiveAlterHandler implements AlterHandler {
             }
           }
           Deadline.checkTimeout();
+          Table table = msdb.getTable(catName, newDbName, newTblName);
+          MTable mTable = msdb.ensureGetMTable(catName, newDbName, newTblName);
           for (Entry<Partition, ColumnStatistics> partColStats : columnStatsNeedUpdated.entries()) {
             ColumnStatistics newPartColStats = partColStats.getValue();
             newPartColStats.getStatsDesc().setDbName(newDbName);
             newPartColStats.getStatsDesc().setTableName(newTblName);
-            msdb.updatePartitionColumnStatistics(newPartColStats, partColStats.getKey().getValues(),
-                writeIdList, newt.getWriteId());
+            msdb.updatePartitionColumnStatistics(table, mTable, newPartColStats, 
+                partColStats.getKey().getValues(), writeIdList, newt.getWriteId());
           }
         } else {
-          alterTableUpdateTableColumnStats(
-              msdb, oldt, newt, environmentContext, writeIdList, conf, null);
+          msdb.alterTable(catName, dbname, name, newt, writeIdList);
         }
       } else {
         // operations other than table rename
@@ -420,14 +452,15 @@ public class HiveAlterHandler implements AlterHandler {
             msdb.alterTable(catName, dbname, name, newt, null);
           } else {
             LOG.warn("Alter table not cascaded to partitions.");
-            alterTableUpdateTableColumnStats(
-                msdb, oldt, newt, environmentContext, writeIdList, conf, null);
+            msdb.alterTable(catName, dbname, name, newt, writeIdList);
           }
         } else {
-          alterTableUpdateTableColumnStats(
-              msdb, oldt, newt, environmentContext, writeIdList, conf, null);
+          msdb.alterTable(catName, dbname, name, newt, writeIdList);
         }
       }
+
+      //HIVE-26504: Table columns stats may exist even for partitioned tables, so it must be updated in all cases
+      updateTableColumnStats(msdb, newt, writeIdList, columnStatistics);
 
       if (transactionalListeners != null && !transactionalListeners.isEmpty()) {
         txnAlterTableEventResponses = MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
@@ -524,7 +557,7 @@ public class HiveAlterHandler implements AlterHandler {
   public Partition alterPartition(final RawStore msdb, Warehouse wh, final String dbname,
     final String name, final List<String> part_vals, final Partition new_part,
     EnvironmentContext environmentContext)
-      throws InvalidOperationException, InvalidObjectException, AlreadyExistsException, MetaException {
+      throws InvalidOperationException, InvalidObjectException, AlreadyExistsException, MetaException, NoSuchObjectException {
     return alterPartition(msdb, wh, MetaStoreUtils.getDefaultCatalog(conf), dbname, name, part_vals, new_part,
         environmentContext, null, null);
   }
@@ -533,7 +566,7 @@ public class HiveAlterHandler implements AlterHandler {
   public Partition alterPartition(RawStore msdb, Warehouse wh, String catName, String dbname,
       String name, List<String> part_vals, final Partition new_part,
       EnvironmentContext environmentContext, IHMSHandler handler, String validWriteIds)
-      throws InvalidOperationException, InvalidObjectException, AlreadyExistsException, MetaException {
+      throws InvalidOperationException, InvalidObjectException, AlreadyExistsException, MetaException, NoSuchObjectException {
     boolean success = false;
     Partition oldPart;
     List<TransactionalMetaStoreEventListener> transactionalListeners = null;
@@ -618,6 +651,7 @@ public class HiveAlterHandler implements AlterHandler {
         throw new InvalidObjectException(
             "Unable to alter partition because table or database does not exist.");
       }
+      MTable mTable = msdb.ensureGetMTable(catName, dbname, name);
       try {
         oldPart = msdb.getPartition(catName, dbname, name, part_vals);
       } catch (NoSuchObjectException e) {
@@ -736,7 +770,7 @@ public class HiveAlterHandler implements AlterHandler {
         for (ColumnStatistics cs : multiColumnStats) {
           cs.getStatsDesc().setPartName(newPartName);
           try {
-            msdb.updatePartitionColumnStatistics(cs, new_part.getValues(),
+            msdb.updatePartitionColumnStatistics(tbl, mTable, cs, new_part.getValues(),
                 validWriteIds, new_part.getWriteId());
           } catch (InvalidInputException iie) {
             throw new InvalidOperationException("Unable to update partition stats in table rename." + iie);
@@ -1011,96 +1045,61 @@ public class HiveAlterHandler implements AlterHandler {
         defaultNewPath.toUri().getPath());
   }
 
-  @VisibleForTesting
-  public static List<ColumnStatistics> alterTableUpdateTableColumnStats(RawStore msdb, Table oldTable, Table newTable,
-      EnvironmentContext ec, String validWriteIds, Configuration conf, List<String> deletedCols)
-      throws MetaException, InvalidObjectException {
-    String catName = normalizeIdentifier(oldTable.isSetCatName() ? oldTable.getCatName() :
-        getDefaultCatalog(conf));
+  public static List<ColumnStatistics> getColumnStats(RawStore msdb, Table oldTable)
+      throws NoSuchObjectException, MetaException {
+    String catName = normalizeIdentifier(oldTable.isSetCatName()
+        ? oldTable.getCatName()
+        : getDefaultCatalog(msdb.getConf()));
     String dbName = oldTable.getDbName().toLowerCase();
     String tableName = normalizeIdentifier(oldTable.getTableName());
-    String newDbName = newTable.getDbName().toLowerCase();
-    String newTableName = normalizeIdentifier(newTable.getTableName());
-    //if its not called from cahced store then update the table
-    boolean doAlterTable = deletedCols == null;
+    List<String> columnNames = oldTable.getSd().getCols().stream().map(FieldSchema::getName).collect(Collectors.toList());
+    return msdb.getTableColumnStatistics(catName, dbName, tableName, columnNames);
+  }
+
+  @VisibleForTesting
+  public static List<ColumnStatistics> deleteTableColumnStats(RawStore msdb, Table oldTable, Table newTable, List<ColumnStatistics> multiColStats)
+      throws InvalidObjectException, MetaException {
     List<ColumnStatistics> newMultiColStats = new ArrayList<>();
-
     try {
-      List<FieldSchema> oldCols = oldTable.getSd().getCols();
-      List<FieldSchema> newCols = newTable.getSd().getCols();
-      List<ColumnStatistics> multiColStats = null;
-      boolean updateColumnStats = !newDbName.equals(dbName) || !newTableName.equals(tableName)
-          || !MetaStoreServerUtils.columnsIncludedByNameType(oldCols, newCols);
-      // Don't bother in the case of ACID conversion.
-      updateColumnStats = updateColumnStats
-          && (TxnUtils.isAcidTable(oldTable) == TxnUtils.isAcidTable(newTable));
-      if (updateColumnStats) {
-        List<String> oldColNames = new ArrayList<>(oldCols.size());
-        for (FieldSchema oldCol : oldCols) {
-          oldColNames.add(oldCol.getName());
-        }
+      String catName = normalizeIdentifier(oldTable.isSetCatName()
+          ? oldTable.getCatName()
+          : getDefaultCatalog(msdb.getConf()));
+      String dbName = oldTable.getDbName().toLowerCase();
+      String tableName = normalizeIdentifier(oldTable.getTableName());
+      String newDbName = newTable.getDbName().toLowerCase();
+      String newTableName = normalizeIdentifier(newTable.getTableName());
+      List<FieldSchema> oldTableCols = oldTable.getSd().getCols();
+      List<FieldSchema> newTableCols = newTable.getSd().getCols();
 
-        // NOTE: this doesn't check stats being compliant, but the alterTable call below does.
-        //       The worst we can do is delete the stats.
-        // Collect column stats which need to be rewritten and remove old stats.
-        multiColStats = msdb.getTableColumnStatistics(catName, dbName, tableName, oldColNames);
-        if (multiColStats.isEmpty()) {
-          updateColumnStats = false;
-        } else {
-          for (ColumnStatistics colStats : multiColStats) {
-            List<ColumnStatisticsObj> statsObjs = colStats.getStatsObj();
-            if (statsObjs != null) {
-              // for out para, this value is initialized by caller.
-              if (deletedCols == null) {
-                deletedCols = new ArrayList<>();
-              }
-              List<ColumnStatisticsObj> newStatsObjs = new ArrayList<>();
-              for (ColumnStatisticsObj statsObj : statsObjs) {
-                boolean found = false;
-                for (FieldSchema newCol : newCols) {
-                  if (statsObj.getColName().equalsIgnoreCase(newCol.getName())
-                      && statsObj.getColType().equalsIgnoreCase(newCol.getType())) {
-                    found = true;
-                    break;
-                  }
-                }
+      boolean nameChanged = !newDbName.equals(dbName) || !newTableName.equals(tableName);
 
-                if (found) {
-                  if (!newDbName.equals(dbName) || !newTableName.equals(tableName)) {
-                    if (doAlterTable) {
-                      msdb.deleteTableColumnStatistics(catName, dbName, tableName, statsObj.getColName(), colStats.getEngine());
-                    }
-                    newStatsObjs.add(statsObj);
-                    deletedCols.add(statsObj.getColName());
-                  }
-                } else {
-                  if (doAlterTable) {
-                    msdb.deleteTableColumnStatistics(catName, dbName, tableName, statsObj.getColName(), colStats.getEngine());
-                  }
-                  deletedCols.add(statsObj.getColName());
-                }
+      if ((nameChanged || !MetaStoreServerUtils.columnsIncludedByNameType(oldTableCols, newTableCols)) &&
+          // Don't bother in the case of ACID conversion.
+          TxnUtils.isAcidTable(oldTable) == TxnUtils.isAcidTable(newTable)) {
+        for (ColumnStatistics colStats : multiColStats) {
+          List<ColumnStatisticsObj> statsObjs = colStats.getStatsObj();
+          List<ColumnStatisticsObj> newStatsObjs = new ArrayList<>();
+
+          if (statsObjs != null) {
+            for (ColumnStatisticsObj statsObj : statsObjs) {
+              boolean found = newTableCols.stream().anyMatch(c -> statsObj.getColName().equalsIgnoreCase(c.getName()) &&
+                  statsObj.getColType().equalsIgnoreCase(c.getType()));
+              if (nameChanged || !found) {
+                msdb.deleteTableColumnStatistics(catName, oldTable.getDbName().toLowerCase(),
+                    normalizeIdentifier(oldTable.getTableName()), statsObj.getColName(), colStats.getEngine());
               }
-              if (doAlterTable) {
-                StatsSetupConst.removeColumnStatsState(newTable.getParameters(), deletedCols);
-                // Change stats
-                ColumnStatisticsDesc statsDesc = colStats.getStatsDesc();
-                statsDesc.setDbName(newDbName);
-                statsDesc.setTableName(newTableName);
-                colStats.setStatsObj(newStatsObjs);
-                newMultiColStats.add(colStats);
+              if (found) {
+                newStatsObjs.add(statsObj);
               }
             }
+            StatsSetupConst.removeColumnStatsState(newTable.getParameters(),
+                statsObjs.stream().map(ColumnStatisticsObj::getColName).collect(Collectors.toList()));
           }
-        }
-      }
-      if (doAlterTable) {
-        Deadline.checkTimeout();
-        // Change to new table and append stats for the new table
-        msdb.alterTable(catName, dbName, tableName, newTable, validWriteIds);
-        if (updateColumnStats) {
-          for (ColumnStatistics colStats : newMultiColStats) {
-            msdb.updateTableColumnStatistics(colStats, validWriteIds, newTable.getWriteId());
-          }
+          ColumnStatisticsDesc statsDesc = colStats.getStatsDesc();
+          statsDesc.setDbName(newDbName);
+          statsDesc.setTableName(newTableName);
+          colStats.setStatsObj(newStatsObjs);
+          newMultiColStats.add(colStats);
         }
       }
     } catch (NoSuchObjectException nsoe) {
@@ -1110,6 +1109,32 @@ public class HiveAlterHandler implements AlterHandler {
       throw new InvalidObjectException("Invalid inputs to update table column stats: " + e);
     }
     return newMultiColStats;
+  }
+
+  @VisibleForTesting
+  public void updateTableColumnStats(RawStore msdb, Table newTable, String validWriteIds, List<ColumnStatistics> columnStatistics)
+      throws MetaException, InvalidObjectException {
+    Deadline.checkTimeout();
+    // Change to new table and append stats for the new table
+    for (ColumnStatistics colStats : columnStatistics) {
+      try {
+        msdb.updateTableColumnStatistics(colStats, validWriteIds, newTable.getWriteId());
+      } catch (NoSuchObjectException nsoe) {
+        LOG.debug("Could not find db entry." + nsoe);
+      } catch (InvalidInputException e) {
+        //should not happen since the input were verified before passed in
+        throw new InvalidObjectException("Invalid inputs to update table column stats: " + e);
+      }
+    }
+  }
+
+  public static List<ColumnStatisticsObj> filterColumnStatsForTableColumns(List<FieldSchema> columns, ColumnStatistics colStats) {
+    return colStats.getStatsObj()
+        .stream()
+        .filter(o -> columns
+            .stream()
+            .anyMatch(column -> o.getColName().equalsIgnoreCase(column.getName()) && o.getColType().equalsIgnoreCase(column.getType())))
+        .collect(Collectors.toList());
   }
 
   public static List<ColumnStatistics> updateOrGetPartitionColumnStats(

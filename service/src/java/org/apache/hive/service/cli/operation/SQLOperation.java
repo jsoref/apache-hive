@@ -82,6 +82,8 @@ import org.apache.hive.service.cli.TableSchema;
 import org.apache.hive.service.cli.session.HiveSession;
 import org.apache.hive.service.server.ThreadWithGarbageCleanup;
 
+import static org.apache.hadoop.hive.shims.HadoopShims.USER_ID;
+
 /**
  * SQLOperation.
  */
@@ -131,7 +133,8 @@ public class SQLOperation extends ExecuteStatementOperation {
     setupSessionIO(parentSession.getSessionState());
 
     queryInfo = new QueryInfo(getState().toString(), getParentSession().getUserName(),
-            getExecutionEngine(), getHandle().getHandleIdentifier().toString());
+        getExecutionEngine(), getParentSession().getSessionHandle().getHandleIdentifier().toString(),
+        getHandle().getHandleIdentifier().toString());
 
     final Metrics metrics = MetricsFactory.getInstance();
     this.submittedQryScp =
@@ -316,18 +319,15 @@ public class SQLOperation extends ExecuteStatementOperation {
         @Override
         public Object run() throws HiveSQLException {
           assert (!parentHive.allowClose());
-          try {
-            Hive.set(parentSessionState.getHiveDb());
-          } catch (HiveException e) {
-            throw new HiveSQLException(e);
-          }
+          Hive.set(parentHive);
           // TODO: can this result in cross-thread reuse of session state?
           SessionState.setCurrentSessionState(parentSessionState);
           PerfLogger.setPerfLogger(SessionState.getPerfLogger());
           if (!embedded) {
             LogUtils.registerLoggingContext(queryState.getConf());
           }
-          ShimLoader.getHadoopShims().setHadoopQueryContext(queryState.getQueryId());
+          ShimLoader.getHadoopShims()
+              .setHadoopQueryContext(String.format(USER_ID, queryState.getQueryId(), parentSessionState.getUserName()));
 
           try {
             if (asyncPrepare) {

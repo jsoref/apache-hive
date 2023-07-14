@@ -38,6 +38,7 @@ import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.util.Util;
 import org.apache.hadoop.hive.metastore.TableType;
+import org.apache.hadoop.hive.ql.io.AcidUtils;
 import org.apache.hadoop.hive.ql.metadata.Table;
 import org.apache.hadoop.hive.ql.optimizer.calcite.reloperators.HiveAggregate;
 import org.apache.hadoop.hive.ql.optimizer.calcite.reloperators.HiveAntiJoin;
@@ -58,7 +59,7 @@ import org.slf4j.LoggerFactory;
  * Checks the query plan for conditions that would make the plan unsuitable for
  * materialized views or query caching:
  * - References to temporary or external tables
- * - References to non-determinisitc functions.
+ * - References to non-deterministic functions.
  */
 public class HiveRelOptMaterializationValidator extends HiveRelShuttleImpl {
   static final Logger LOG = LoggerFactory.getLogger(HiveRelOptMaterializationValidator.class);
@@ -88,8 +89,9 @@ public class HiveRelOptMaterializationValidator extends HiveRelShuttleImpl {
     if (tab.isTemporary()) {
       fail(tab.getTableName() + " is a temporary table");
     }
-    if (tab.getTableType() == TableType.EXTERNAL_TABLE) {
-      fail(tab.getFullyQualifiedName() + " is an external table");
+    if (tab.getTableType() == TableType.EXTERNAL_TABLE &&
+        !(tab.getStorageHandler() != null && tab.getStorageHandler().areSnapshotsSupported())) {
+      fail(tab.getFullyQualifiedName() + " is an external table and does not support snapshots");
     }
     return hiveScan;
   }

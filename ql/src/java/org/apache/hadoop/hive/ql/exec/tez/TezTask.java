@@ -18,7 +18,6 @@
 
 package org.apache.hadoop.hive.ql.exec.tez;
 
-import org.apache.hadoop.hive.metastore.conf.MetastoreConf;
 import org.apache.hadoop.hive.ql.session.SessionStateUtil;
 import org.apache.hive.common.util.Ref;
 import org.apache.hadoop.hive.ql.exec.tez.UserPoolMapping.MappingInput;
@@ -39,6 +38,7 @@ import javax.annotation.Nullable;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hive.common.LogUtils;
 import org.apache.hadoop.hive.common.ServerUtils;
 import org.apache.hadoop.hive.common.metrics.common.Metrics;
 import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
@@ -93,6 +93,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.annotations.VisibleForTesting;
+
+import static org.apache.hadoop.hive.shims.HadoopShims.USER_ID;
 
 /**
  *
@@ -197,8 +199,9 @@ public class TezTask extends Task<TezWork> {
       // DAG scratch dir. We get a session from the pool so it may be different from Tez one.
       // TODO: we could perhaps reuse the same directory for HiveResources?
       Path scratchDir = utils.createTezDir(ctx.getMRScratchDir(), conf);
-      CallerContext callerContext = CallerContext.create(
-          "HIVE", queryPlan.getQueryId(), "HIVE_QUERY_ID", queryPlan.getQueryStr());
+      CallerContext callerContext =
+          CallerContext.create("HIVE", String.format(USER_ID, queryPlan.getQueryId(), userName), "HIVE_QUERY_ID",
+              queryPlan.getQueryStr());
 
       perfLogger.perfLogBegin(CLASS_NAME, PerfLogger.TEZ_GET_SESSION);
       session = sessionRef.value = WorkloadManagerFederation.getSession(
@@ -249,8 +252,10 @@ public class TezTask extends Task<TezWork> {
         }
 
         // Log all the info required to find the various logs for this query
+        String dagId = this.dagClient.getDagIdentifierString();
         LOG.info("HS2 Host: [{}], Query ID: [{}], Dag ID: [{}], DAG Session ID: [{}]", ServerUtils.hostname(), queryId,
-            this.dagClient.getDagIdentifierString(), this.dagClient.getSessionIdentifierString());
+            dagId, this.dagClient.getSessionIdentifierString());
+        LogUtils.putToMDC(LogUtils.DAGID_KEY, dagId);
 
         // finally monitor will print progress until the job is done
         TezJobMonitor monitor = new TezJobMonitor(work.getAllWork(), dagClient, conf, dag, ctx, counters);

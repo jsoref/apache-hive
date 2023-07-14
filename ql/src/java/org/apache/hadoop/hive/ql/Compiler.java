@@ -32,6 +32,7 @@ import org.apache.hadoop.hive.metastore.HiveMetaStoreUtils;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.Schema;
 import org.apache.hadoop.hive.metastore.api.TxnType;
+import org.apache.hadoop.hive.metastore.utils.MetaStoreServerUtils;
 import org.apache.hadoop.hive.ql.exec.ExplainTask;
 import org.apache.hadoop.hive.ql.exec.FetchTask;
 import org.apache.hadoop.hive.ql.exec.repl.util.ReplUtils;
@@ -89,7 +90,7 @@ public class Compiler {
 
   /**
    * @param deferClose indicates if the close/destroy should be deferred when the process has been interrupted
-   *             it should be set to true if the compile is called within another method like runInternal,
+   *             it should be set to true if the compile method is called within another method like runInternal,
    *             which defers the close to the called in that method.
    */
   public QueryPlan compile(String rawCommand, boolean deferClose) throws CommandProcessorException {
@@ -191,7 +192,6 @@ public class Compiler {
     // because at that point we need access to the objects.
     Hive.get().getMSC().flushCache();
 
-    driverContext.setBackupContext(new Context(context));
     boolean executeHooks = driverContext.getHookRunner().hasPreAnalyzeHooks();
 
     HiveSemanticAnalyzerHookContext hookCtx = new HiveSemanticAnalyzerHookContextImpl();
@@ -264,7 +264,7 @@ public class Compiler {
 
   private void openTransaction(TxnType txnType) throws LockException, CommandProcessorException {
     if (DriverUtils.checkConcurrency(driverContext) && startImplicitTxn(driverContext.getTxnManager()) &&
-        !driverContext.getTxnManager().isTxnOpen() && txnType != TxnType.COMPACTION) {
+        !driverContext.getTxnManager().isTxnOpen() && !MetaStoreServerUtils.isCompactionTxn(txnType)) {
       String userFromUGI = DriverUtils.getUserFromUGI(driverContext);
       if (HiveOperation.REPLDUMP.equals(driverContext.getQueryState().getHiveOperation())
          || HiveOperation.REPLLOAD.equals(driverContext.getQueryState().getHiveOperation())) {

@@ -52,7 +52,6 @@ import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
 import org.apache.hadoop.hive.ql.plan.MapWork;
 import org.apache.hadoop.hive.ql.plan.OperatorDesc;
 import org.apache.hadoop.hive.ql.plan.PartitionDesc;
-import org.apache.hadoop.hive.ql.plan.PlanUtils;
 import org.apache.hadoop.hive.ql.plan.TableDesc;
 import org.apache.hadoop.hive.ql.plan.TableScanDesc;
 import org.apache.hadoop.hive.ql.session.SessionState;
@@ -696,7 +695,7 @@ public class HiveInputFormat<K extends WritableComparable, V extends Writable>
     // We need to iterate to detect original directories, that are supported in MM but not ACID.
     boolean hasOriginalFiles = false, hasAcidDirs = false;
     List<Path> originalDirectories = new ArrayList<>();
-    for (FileStatus file : fs.listStatus(dir, AcidUtils.hiddenFileFilter)) {
+    for (FileStatus file : fs.listStatus(dir, FileUtils.HIDDEN_FILES_PATH_FILTER)) {
       Path currDir = file.getPath();
       Utilities.FILE_OP_LOGGER.trace("Checking {} for being an input", currDir);
       if (!file.isDirectory()) {
@@ -918,6 +917,7 @@ public class HiveInputFormat<K extends WritableComparable, V extends Writable>
     }
 
     Utilities.addTableSchemaToConf(jobConf, tableScan);
+    Utilities.setPartitionColumnNames(jobConf, tableScan);
 
     // construct column name list and types for reference by filter push down
     Utilities.setColumnNameList(jobConf, tableScan);
@@ -986,13 +986,20 @@ public class HiveInputFormat<K extends WritableComparable, V extends Writable>
     if (scanDesc.getAsOfTimestamp() != null) {
       ZoneId timeZone = SessionState.get() == null ? new HiveConf().getLocalTimeZone() :
           SessionState.get().getConf().getLocalTimeZone();
-      TimestampTZ time = TimestampTZUtil.parse(PlanUtils.stripQuotes(scanDesc.getAsOfTimestamp()), timeZone);
-
+      TimestampTZ time = TimestampTZUtil.parse(scanDesc.getAsOfTimestamp(), timeZone);
       jobConf.set(TableScanDesc.AS_OF_TIMESTAMP, Long.toString(time.toEpochMilli()));
     }
 
     if (scanDesc.getAsOfVersion() != null) {
       jobConf.set(TableScanDesc.AS_OF_VERSION, scanDesc.getAsOfVersion());
+    }
+
+    if (scanDesc.getVersionIntervalFrom() != null) {
+      jobConf.set(TableScanDesc.FROM_VERSION, scanDesc.getVersionIntervalFrom());
+    }
+
+    if (scanDesc.getBranchName() != null) {
+      jobConf.set(TableScanDesc.BRANCH_NAME, scanDesc.getBranchName());
     }
   }
 

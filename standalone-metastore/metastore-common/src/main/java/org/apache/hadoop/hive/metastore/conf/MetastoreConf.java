@@ -67,6 +67,9 @@ public class MetastoreConf {
   static final String DEFAULT_STORAGE_SCHEMA_READER_CLASS =
       "org.apache.hadoop.hive.metastore.DefaultStorageSchemaReader";
   @VisibleForTesting
+  static final String SERDE_STORAGE_SCHEMA_READER_CLASS =
+      "org.apache.hadoop.hive.metastore.SerDeStorageSchemaReader";
+  @VisibleForTesting
   static final String HIVE_ALTER_HANDLE_CLASS =
       "org.apache.hadoop.hive.metastore.HiveAlterHandler";
   @VisibleForTesting
@@ -102,6 +105,8 @@ public class MetastoreConf {
 
   public static final String METASTORE_AUTHENTICATION_LDAP_USERMEMBERSHIPKEY_NAME =
           "metastore.authentication.ldap.userMembershipKey";
+  public static final String METASTORE_RETRYING_HANDLER_CLASS =
+          "org.apache.hadoop.hive.metastore.RetryingHMSHandler";
 
   private static final Map<String, ConfVars> metaConfs = new HashMap<>();
   private static volatile URL hiveSiteURL = null;
@@ -183,7 +188,6 @@ public class MetastoreConf {
       ConfVars.USE_THRIFT_SASL,
       ConfVars.METASTORE_CLIENT_AUTH_MODE,
       ConfVars.METASTORE_CLIENT_PLAIN_USERNAME,
-      ConfVars.TOKEN_SIGNATURE,
       ConfVars.CACHE_PINOBJTYPES,
       ConfVars.CONNECTION_POOLING_TYPE,
       ConfVars.VALIDATE_TABLES,
@@ -286,9 +290,6 @@ public class MetastoreConf {
     ACID_HOUSEKEEPER_SERVICE_INTERVAL("metastore.acid.housekeeper.interval",
         "hive.metastore.acid.housekeeper.interval", 60, TimeUnit.SECONDS,
         "Time interval describing how often the acid housekeeper runs."),
-    ACID_HOUSEKEEPER_SERVICE_START("metastore.acid.housekeeper.start",
-        "hive.metastore.acid.housekeeper.start", 60, TimeUnit.SECONDS,
-        "Time delay of 1st acid housekeeper run after metastore has started."),
     ACID_TXN_CLEANER_INTERVAL("metastore.acid.txn.cleaner.interval",
         "hive.metastore.acid.txn.cleaner.interval", 10, TimeUnit.SECONDS,
         "Time interval describing how often aborted and committed txns are cleaned."),
@@ -403,6 +404,8 @@ public class MetastoreConf {
             "has an infinite lifetime."),
     CLIENT_SOCKET_TIMEOUT("metastore.client.socket.timeout", "hive.metastore.client.socket.timeout", 600,
             TimeUnit.SECONDS, "MetaStore Client socket timeout in seconds"),
+    CLIENT_CONNECTION_TIMEOUT("metastore.client.connection.timeout", "hive.metastore.client.connection.timeout", 600,
+            TimeUnit.SECONDS, "MetaStore Client connection timeout in seconds"),
     COMPACTOR_HISTORY_RETENTION_DID_NOT_INITIATE("metastore.compactor.history.retention.did.not.initiate",
         "hive.compactor.history.retention.did.not.initiate", 2,
         new RangeValidator(0, 100), "Determines how many compaction records in state " +
@@ -441,6 +444,12 @@ public class MetastoreConf {
     COMPACTOR_USE_CUSTOM_POOL("metastore.compactor.use.custom.pool", "hive.compactor.use.custom.pool",
             false, "internal usage only -- use custom connection pool specific to compactor components."
     ),
+    COMPACTOR_WORKER_POOL_TIMEOUT(
+        "metastore.compactor.worker.pool.timeout",
+        "hive.compactor.worker.pool.timeout",
+        12, TimeUnit.HOURS,
+        "Time in hours after which a compaction assigned to a custom compaction Worker pool can be picked " +
+            "up by the default compaction Worker pool."),
     COMPACTOR_OLDEST_REPLICATION_OPENTXN_THRESHOLD_WARNING(
         "metastore.compactor.oldest.replication.open.txn.threshold.warning",
         "hive.compactor.oldest.replication.open.txn.threshold.warning",
@@ -554,8 +563,25 @@ public class MetastoreConf {
         "means that the current metastore will run the housekeeping tasks. If configuration" +
         "metastore.thrift.bind.host is set on the intended leader metastore, this value should " +
         "match that configuration. Otherwise it should be same as the hostname returned by " +
-        "InetAddress#getLocalHost#getHostName(). Given the uncertainty in the later " +
+        "InetAddress#getLocalHost#getCanonicalHostName(). Given the uncertainty in the later " +
         "it is desirable to configure metastore.thrift.bind.host on the intended leader HMS."),
+    METASTORE_HOUSEKEEPING_LEADER_ELECTION("metastore.housekeeping.leader.election",
+        "metastore.housekeeping.leader.election",
+        "host", new StringSetValidator("host", "lock"),
+        "Set to host, HMS will choose the leader by the configured metastore.housekeeping.leader.hostname.\n" +
+        "Set to lock, HMS will use the hive lock to elect the leader."),
+    METASTORE_HOUSEKEEPING_LEADER_AUDITTABLE("metastore.housekeeping.leader.auditTable",
+        "metastore.housekeeping.leader.auditTable", "",
+        "Audit the leader election event to a plain json table when configured."),
+    METASTORE_HOUSEKEEPING_LEADER_NEW_AUDIT_FILE("metastore.housekeeping.leader.newAuditFile",
+        "metastore.housekeeping.leader.newAuditFile", false,
+        "Whether to create a new audit file in response to the new election event " +
+        "when the metastore.housekeeping.leader.auditTable is not empty.\n" +
+        "True for creating a new file, false otherwise."),
+    METASTORE_HOUSEKEEPING_LEADER_AUDIT_FILE_LIMIT("metastore.housekeeping.leader.auditFiles.limit",
+        "metastore.housekeeping.leader.auditFiles.limit", 10,
+        "Limit the number of small audit files when metastore.housekeeping.leader.newAuditFile is true.\n" +
+        "If the number of audit files exceeds the limit, then the oldest will be deleted."),
     METASTORE_HOUSEKEEPING_THREADS_ON("metastore.housekeeping.threads.on",
         "hive.metastore.housekeeping.threads.on", false,
         "Whether to run the tasks under metastore.task.threads.remote on this metastore instance or not.\n" +
@@ -593,7 +619,12 @@ public class MetastoreConf {
         "Percentage (fractional) size of the delta files relative to the base directory. Deltas smaller than this threshold " +
             "count as small deltas. Default 0.01 = 1%.)"),
     COMPACTOR_INITIATOR_ON("metastore.compactor.initiator.on", "hive.compactor.initiator.on", false,
-        "Whether to run the initiator and cleaner threads on this metastore instance or not.\n" +
+        "Whether to run the initiator thread on this metastore instance or not.\n" +
+            "Set this to true on one instance of the Thrift metastore service as part of turning\n" +
+            "on Hive transactions. For a complete list of parameters required for turning on\n" +
+            "transactions, see hive.txn.manager."),
+    COMPACTOR_CLEANER_ON("metastore.compactor.cleaner.on", "hive.compactor.cleaner.on", false,
+        "Whether to run the cleaner thread on this metastore instance or not.\n" +
             "Set this to true on one instance of the Thrift metastore service as part of turning\n" +
             "on Hive transactions. For a complete list of parameters required for turning on\n" +
             "transactions, see hive.txn.manager."),
@@ -628,6 +659,13 @@ public class MetastoreConf {
             "hive.compactor.cleaner.retry.retentionTime", 300, TimeUnit.SECONDS, new TimeValidator(TimeUnit.SECONDS),
             "Initial value of the cleaner retry retention time. The delay has a backoff, and calculated the following way: " +
             "pow(2, number_of_failed_attempts) * HIVE_COMPACTOR_CLEANER_RETRY_RETENTION_TIME."),
+    COMPACTOR_CLEANER_TABLECACHE_ON("metastore.compactor.cleaner.tablecache.on",
+            "hive.compactor.cleaner.tablecache.on", true,
+            "Enable table caching in the cleaner. Currently the cache is cleaned after each cycle."),
+    COMPACTOR_CLEAN_ABORTS_USING_CLEANER("metastore.compactor.clean.aborts.using.cleaner", "hive.compactor.clean.aborts.using.cleaner", true,
+            "Whether to use cleaner for cleaning aborted directories or not.\n" +
+            "Set to true when cleaner is expected to clean delta/delete-delta directories from aborted transactions.\n" +
+            "Otherwise the cleanup of such directories will take place within the compaction cycle."),
     HIVE_COMPACTOR_CONNECTION_POOLING_MAX_CONNECTIONS("metastore.compactor.connectionPool.maxPoolSize",
             "hive.compactor.connectionPool.maxPoolSize", 5,
             "Specify the maximum number of connections in the connection pool used by the compactor."),
@@ -681,6 +719,10 @@ public class MetastoreConf {
         "Default transaction isolation level for identity generation."),
     DATANUCLEUS_USE_LEGACY_VALUE_STRATEGY("datanucleus.rdbms.useLegacyNativeValueStrategy",
         "datanucleus.rdbms.useLegacyNativeValueStrategy", true, ""),
+    DATANUCLEUS_QUERY_SQL_ALLOWALL("datanucleus.query.sql.allowAll", "datanucleus.query.sql.allowAll",
+        true, "In strict JDO all SQL queries must begin with \"SELECT ...\", and consequently it "
+        + "is not possible to execute queries that change data. This DataNucleus property when set to true allows "
+        + "insert, update and delete operations from JDO SQL. Default value is true."),
 
     // Parameters for configuring SSL encryption to the database store
     // If DBACCESS_USE_SSL is false, then all other DBACCESS_SSL_* properties will be ignored
@@ -843,6 +885,9 @@ public class MetastoreConf {
             "testing only."),
     HMS_HANDLER_INTERVAL("metastore.hmshandler.retry.interval", "hive.hmshandler.retry.interval",
         2000, TimeUnit.MILLISECONDS, "The time between HMSHandler retry attempts on failure."),
+    HMS_HANDLER_PROXY_CLASS("metastore.hmshandler.proxy", "hive.metastore.hmshandler.proxy",
+        METASTORE_RETRYING_HANDLER_CLASS,
+        "The proxy class name of HMSHandler, default is RetryingHMSHandler."),
     IDENTIFIER_FACTORY("datanucleus.identifierFactory",
         "datanucleus.identifierFactory", "datanucleus1",
         "Name of the identifier factory to use when generating table/column names etc. \n" +
@@ -850,9 +895,6 @@ public class MetastoreConf {
     INIT_HOOKS("metastore.init.hooks", "hive.metastore.init.hooks", "",
         "A comma separated list of hooks to be invoked at the beginning of HMSHandler initialization. \n" +
             "An init hook is specified as the name of Java class which extends org.apache.riven.MetaStoreInitListener."),
-    INIT_METADATA_COUNT_ENABLED("metastore.initial.metadata.count.enabled",
-        "hive.metastore.initial.metadata.count.enabled", true,
-        "Enable a metadata count at metastore startup for metrics."),
     INTEGER_JDO_PUSHDOWN("metastore.integral.jdo.pushdown",
         "hive.metastore.integral.jdo.pushdown", false,
         "Allow JDO query pushdown for integral partition columns in metastore. Off by default. This\n" +
@@ -957,6 +999,19 @@ public class MetastoreConf {
             "For example: (&(objectClass=group)(objectClass=top)(instanceType=4)(cn=Domain*)) \n" +
             "(&(objectClass=person)(|(sAMAccountName=admin)(|(memberOf=CN=Domain Admins,CN=Users,DC=domain,DC=com)" +
             "(memberOf=CN=Administrators,CN=Builtin,DC=domain,DC=com))))"),
+    METASTORE_PLAIN_LDAP_USERSEARCHFILTER("metastore.authentication.ldap.userSearchFilter",
+        "hive.metastore.authentication.ldap.userSearchFilter", "",
+        "User search filter to be used with baseDN to search for users\n" +
+            "For example: (&(uid={0})(objectClass=person))"),
+    METASTORE_PLAIN_LDAP_GROUPBASEDN("metastore.authentication.ldap.groupBaseDN",
+        "hive.metastore.authentication.ldap.groupBaseDN", "",
+        "BaseDN for Group Search. This is used in conjunction with metastore.authentication.ldap.baseDN\n" +
+            "and \n" +
+            "request, succeeds if the group is part of the resultset."),
+    METASTORE_PLAIN_LDAP_GROUPSEARCHFILTER("metastore.authentication.ldap.groupSearchFilter",
+        "hive.metastore.authentication.ldap.groupSearchFilter", "",
+        "Group search filter to be used with baseDN, userSearchFilter, groupBaseDN to search for users in groups\n" +
+            "For example: (&(|(memberUid={0})(memberUid={1}))(objectClass=posixGroup))\n"),
     METASTORE_PLAIN_LDAP_BIND_USER("metastore.authentication.ldap.binddn",
             "hive.metastore.authentication.ldap.binddn", "",
 "The user with which to bind to the LDAP server, and search for the full domain name " +
@@ -1123,7 +1178,7 @@ public class MetastoreConf {
     // Partition management task params
     PARTITION_MANAGEMENT_TASK_FREQUENCY("metastore.partition.management.task.frequency",
       "metastore.partition.management.task.frequency",
-      300, TimeUnit.SECONDS, "Frequency at which timer task runs to do automatic partition management for tables\n" +
+      6, TimeUnit.HOURS, "Frequency at which timer task runs to do automatic partition management for tables\n" +
       "with table property 'discover.partitions'='true'. Partition management include 2 pieces. One is partition\n" +
       "discovery and other is partition retention period. When 'discover.partitions'='true' is set, partition\n" +
       "management will look for partitions in table location and add partitions objects for it in metastore.\n" +
@@ -1319,6 +1374,8 @@ public class MetastoreConf {
         "A flag to gather statistics (only basic) automatically during the INSERT OVERWRITE command."),
     STATS_FETCH_BITVECTOR("metastore.stats.fetch.bitvector", "hive.stats.fetch.bitvector", false,
         "Whether we fetch bitvector when we compute ndv. Users can turn it off if they want to use old schema"),
+    STATS_FETCH_KLL("metastore.stats.fetch.kll", "hive.stats.fetch.kll", false,
+        "Whether we fetch KLL data sketches to enable histogram statistics"),
     STATS_NDV_TUNER("metastore.stats.ndv.tuner", "hive.metastore.stats.ndv.tuner", 0.0,
         "Provides a tunable parameter between the lower bound and the higher bound of ndv for aggregate ndv across all the partitions. \n" +
             "The lower bound is equal to the maximum of ndv of all the partitions. The higher bound is equal to the sum of ndv of all the partitions.\n" +
@@ -1344,7 +1401,7 @@ public class MetastoreConf {
         "hive.metastore.stats.auto.analyze.worker.count", 1,
         "Number of parallel analyze commands to run for background stats update."),
     STORAGE_SCHEMA_READER_IMPL("metastore.storage.schema.reader.impl", "metastore.storage.schema.reader.impl",
-        DEFAULT_STORAGE_SCHEMA_READER_CLASS,
+        SERDE_STORAGE_SCHEMA_READER_CLASS,
         "The class to use to read schemas from storage.  It must implement " +
         "org.apache.hadoop.hive.metastore.StorageSchemaReader"),
     STORE_MANAGER_TYPE("datanucleus.storeManagerType", "datanucleus.storeManagerType", "rdbms", "metadata store type"),
@@ -1399,6 +1456,10 @@ public class MetastoreConf {
                 "If dynamic service discovery mode is set, the URIs are used to connect to the" +
                 " corresponding service discovery servers e.g. a zookeeper. Otherwise they are " +
                 "used as URIs for remote metastore."),
+    THRIFT_METASTORE_CLIENT_MAX_MESSAGE_SIZE("metastore.thrift.client.max.message.size",
+        "hive.thrift.client.max.message.size", "1gb", new SizeValidator(-1L, true, (long) Integer.MAX_VALUE, true),
+        "Thrift client configuration for max message size. 0 or -1 will use the default defined in the Thrift " +
+        "library. The upper limit is 2147483648 bytes (or 2gb)."),
     THRIFT_SERVICE_DISCOVERY_MODE("metastore.service.discovery.mode",
             "hive.metastore.service.discovery.mode",
             "",
@@ -1515,8 +1576,16 @@ public class MetastoreConf {
     TXN_OPENTXN_TIMEOUT("metastore.txn.opentxn.timeout", "hive.txn.opentxn.timeout", 1000, TimeUnit.MILLISECONDS,
         "Time before an open transaction operation should persist, otherwise it is considered invalid and rolled back"),
     TXN_USE_MIN_HISTORY_LEVEL("metastore.txn.use.minhistorylevel", "hive.txn.use.minhistorylevel", true,
-        "Set this to false, for the TxnHandler and Cleaner to not use MinHistoryLevel table and take advantage of openTxn optimisation.\n"
+        "Set this to false, for the TxnHandler and Cleaner to not use MIN_HISTORY_LEVEL table and take advantage of openTxn optimisation.\n"
             + "If the table is dropped HMS will switch this flag to false."),
+    TXN_USE_MIN_HISTORY_WRITE_ID("metastore.txn.use.minhistorywriteid", "hive.txn.use.minhistorywriteid", false,
+      "Set this to true, to avoid global minOpenTxn check in Cleaner.\n"
+            + "If the table is dropped HMS will switch this flag to false."),
+    LOCK_NUMRETRIES("metastore.lock.numretries", "hive.lock.numretries", 100,
+        "The number of times you want to try to get all the locks"),
+    LOCK_SLEEP_BETWEEN_RETRIES("metastore.lock.sleep.between.retries", "hive.lock.sleep.between.retries", 60, TimeUnit.SECONDS,
+        new TimeValidator(TimeUnit.SECONDS, 0L, false, Long.MAX_VALUE, false),
+        "The maximum sleep time between various retries"),
     URI_RESOLVER("metastore.uri.resolver", "hive.metastore.uri.resolver", "",
             "If set, fully qualified class name of resolver for hive metastore uri's"),
     USERS_IN_ADMIN_ROLE("metastore.users.in.admin.role", "hive.users.in.admin.role", "", false,
@@ -1554,6 +1623,9 @@ public class MetastoreConf {
                     " and password. Any other value is ignored right now but may be used later."
                 + "If JWT- Supported only in HTTP transport mode. If set, HMS Client will pick the value of JWT from "
                 + "environment variable HMS_JWT and set it in Authorization header in http request"),
+    METASTORE_CLIENT_ADDITIONAL_HEADERS("metastore.client.http.additional.headers",
+        "hive.metastore.client.http.additional.headers", "",
+        "Comma separated list of headers which are passed to the metastore service in the http headers"),
     METASTORE_CLIENT_PLAIN_USERNAME("metastore.client.plain.username",
             "hive.metastore.client.plain.username",  "",
         "The username used by the metastore client when " +
@@ -1598,18 +1670,21 @@ public class MetastoreConf {
         "Batch size for partition and other object retrieval from the underlying DB in JDO.\n" +
         "The JDO implementation such as DataNucleus may run into issues when the generated queries are\n" +
         "too large. Use this parameter to break the query into multiple batches. -1 means no batching."),
+    /**
+     * @deprecated Deprecated due to HIVE-26443
+     */
+    @Deprecated
     HIVE_METASTORE_RUNWORKER_IN("hive.metastore.runworker.in",
-        "hive.metastore.runworker.in", "metastore", new StringSetValidator("metastore", "hs2"),
-        "Chooses where the compactor worker threads should run, Only possible values"
-            + " are \"metastore\" and \"hs2\""),
-
+        "hive.metastore.runworker.in", "hs2", new StringSetValidator("metastore", "hs2"),
+        "Deprecated. HMS side compaction workers doesn't support pooling. With the concept of compaction " +
+            "pools (HIVE-26443), running workers on HMS side is still supported but not suggested anymore. " +
+            "This config value will be removed in the future.\n" +
+            "Chooses where the compactor worker threads should run, Only possible values are \"metastore\" and \"hs2\""),
     // Hive values we have copied and use as is
     // These two are used to indicate that we are running tests
     HIVE_IN_TEST("hive.in.test", "hive.in.test", false, "internal usage only, true in test mode"),
     HIVE_IN_TEZ_TEST("hive.in.tez.test", "hive.in.tez.test", false,
         "internal use only, true when in testing tez"),
-    HIVE_IN_TEST_ICEBERG("hive.in.iceberg.test", "hive.in.iceberg.test", false,
-        "internal usage only, true when testing iceberg"),
     // We need to track this as some listeners pass it through our config and we need to honor
     // the system properties.
     HIVE_AUTHORIZATION_MANAGER("hive.security.authorization.manager",
@@ -1630,7 +1705,7 @@ public class MetastoreConf {
     HIVE_TXN_MANAGER("hive.txn.manager", "hive.txn.manager",
         "org.apache.hadoop.hive.ql.lockmgr.DummyTxnManager",
         "Set to org.apache.hadoop.hive.ql.lockmgr.DbTxnManager as part of turning on Hive\n" +
-            "transactions, which also requires appropriate settings for hive.compactor.initiator.on,\n" +
+            "transactions, which also requires appropriate settings for hive.compactor.initiator.on,hive.compactor.cleaner.on,\n" +
             "hive.compactor.worker.threads, hive.support.concurrency (true),\n" +
             "and hive.exec.dynamic.partition.mode (nonstrict).\n" +
             "The default DummyTxnManager replicates pre-Hive-0.13 behavior and provides\n" +
@@ -1655,6 +1730,30 @@ public class MetastoreConf {
           "metastore.use.custom.database.product is set to true."),
     HIVE_BLOBSTORE_SUPPORTED_SCHEMES("hive.blobstore.supported.schemes", "hive.blobstore.supported.schemes", "s3,s3a,s3n",
             "Comma-separated list of supported blobstore schemes."),
+
+    // Property-maps
+    PROPERTIES_CACHE_CAPACITY("hive.metastore.properties.cache.capacity",
+        "hive.metastore.properties.cache.maxsize", 64,
+        "Maximum number of property-maps (collection of properties for one entity) held in cache per store."
+    ),
+    PROPERTIES_CACHE_LOADFACTOR("hive.metastore.properties.cache.loadfactor",
+        "hive.metastore.properties.cache.maxsize", 0.75d,
+        "Property-maps cache map initial fill factor (> 0.0, < 1.0)."
+    ),
+    PROPERTIES_SERVLET_PATH("hive.metastore.properties.servlet.path",
+        "hive.metastore.properties.servlet.path", "hmscli",
+        "Property-maps servlet path component of URL endpoint."
+    ),
+    PROPERTIES_SERVLET_PORT("hive.metastore.properties.servlet.port",
+        "hive.metastore.properties.servlet.port", -1,
+        "Property-maps servlet server port. Negative value disables the servlet," +
+            " 0 will let the system determine the servlet server port," +
+            " positive value will be used as-is."
+    ),
+    PROPERTIES_SERVLET_AUTH("hive.metastore.properties.servlet.auth",
+        "hive.metastore.properties.servlet.auth", "jwt",
+        "Property-maps servlet authentication method (simple or jwt)."
+    ),
 
     // Deprecated Hive values that we are keeping for backwards compatibility.
     @Deprecated
@@ -1886,6 +1985,7 @@ public class MetastoreConf {
       ConfVars.DATANUCLEUS_PLUGIN_REGISTRY_BUNDLE_CHECK,
       ConfVars.DATANUCLEUS_TRANSACTION_ISOLATION,
       ConfVars.DATANUCLEUS_USE_LEGACY_VALUE_STRATEGY,
+      ConfVars.DATANUCLEUS_QUERY_SQL_ALLOWALL,
       ConfVars.DETACH_ALL_ON_COMMIT,
       ConfVars.IDENTIFIER_FACTORY,
       ConfVars.MANAGER_FACTORY_CLASS,

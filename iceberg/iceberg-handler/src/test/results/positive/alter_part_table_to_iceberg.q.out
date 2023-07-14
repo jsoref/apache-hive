@@ -111,12 +111,20 @@ POSTHOOK: Output: hdfs://### HDFS PATH ###
 7	three
 8	three
 9	four
-PREHOOK: query: alter table tbl_orc set tblproperties ('storage_handler'='org.apache.iceberg.mr.hive.HiveIcebergStorageHandler')
-PREHOOK: type: ALTERTABLE_PROPERTIES
+PREHOOK: query: explain alter table tbl_orc convert to iceberg
+PREHOOK: type: ALTERTABLE_CONVERT
 PREHOOK: Input: default@tbl_orc
-PREHOOK: Output: default@tbl_orc
-POSTHOOK: query: alter table tbl_orc set tblproperties ('storage_handler'='org.apache.iceberg.mr.hive.HiveIcebergStorageHandler')
-POSTHOOK: type: ALTERTABLE_PROPERTIES
+POSTHOOK: query: explain alter table tbl_orc convert to iceberg
+POSTHOOK: type: ALTERTABLE_CONVERT
+POSTHOOK: Input: default@tbl_orc
+Stage-0
+  Convert operation{"table name:":"default.tbl_orc","spec:":"AlterTableConvertSpec{ConvertTo=iceberg, TBLProperties={}}"}
+
+PREHOOK: query: alter table tbl_orc convert to iceberg
+PREHOOK: type: ALTERTABLE_CONVERT
+PREHOOK: Input: default@tbl_orc
+POSTHOOK: query: alter table tbl_orc convert to iceberg
+POSTHOOK: type: ALTERTABLE_CONVERT
 POSTHOOK: Input: default@tbl_orc
 POSTHOOK: Output: default@tbl_orc
 PREHOOK: query: describe formatted tbl_orc
@@ -143,7 +151,13 @@ Table Parameters:
 	EXTERNAL            	TRUE                
 	MIGRATED_TO_ICEBERG 	true                
 	bucketing_version   	2                   
+	current-schema      	{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":false,\"type\":\"int\"},{\"id\":2,\"name\":\"b\",\"required\":false,\"type\":\"string\"}]}
+	current-snapshot-id 	#Masked#
+	current-snapshot-summary	{\"added-data-files\":\"4\",\"added-records\":\"9\",\"added-files-size\":\"#Masked#\",\"changed-partition-count\":\"4\",\"total-records\":\"9\",\"total-files-size\":\"#Masked#\",\"total-data-files\":\"4\",\"total-delete-files\":\"0\",\"total-position-deletes\":\"0\",\"total-equality-deletes\":\"0\"}
+	current-snapshot-timestamp-ms	#Masked#       
+	default-partition-spec	{\"spec-id\":0,\"fields\":[{\"name\":\"b\",\"transform\":\"identity\",\"source-id\":2,\"field-id\":1000}]}
 	engine.hive.enabled 	true                
+	iceberg.orc.files.only	true                
 #### A masked pattern was here ####
 	metadata_location   	hdfs://### HDFS PATH ###
 	numFiles            	4                   
@@ -156,6 +170,7 @@ Table Parameters:
 	                           	  \"field-id\" : 2, 
 	                           	  \"names\" : [ \"b\" ]
 	                           	} ]                 
+	snapshot-count      	1                   
 	storage_handler     	org.apache.iceberg.mr.hive.HiveIcebergStorageHandler
 	table_type          	ICEBERG             
 	totalSize           	#Masked#                 
@@ -307,12 +322,20 @@ POSTHOOK: Output: hdfs://### HDFS PATH ###
 7	three
 8	three
 9	four
-PREHOOK: query: alter table tbl_parquet set tblproperties ('storage_handler'='org.apache.iceberg.mr.hive.HiveIcebergStorageHandler')
-PREHOOK: type: ALTERTABLE_PROPERTIES
+PREHOOK: query: explain alter table tbl_parquet convert to iceberg
+PREHOOK: type: ALTERTABLE_CONVERT
 PREHOOK: Input: default@tbl_parquet
-PREHOOK: Output: default@tbl_parquet
-POSTHOOK: query: alter table tbl_parquet set tblproperties ('storage_handler'='org.apache.iceberg.mr.hive.HiveIcebergStorageHandler')
-POSTHOOK: type: ALTERTABLE_PROPERTIES
+POSTHOOK: query: explain alter table tbl_parquet convert to iceberg
+POSTHOOK: type: ALTERTABLE_CONVERT
+POSTHOOK: Input: default@tbl_parquet
+Stage-0
+  Convert operation{"table name:":"default.tbl_parquet","spec:":"AlterTableConvertSpec{ConvertTo=iceberg, TBLProperties={}}"}
+
+PREHOOK: query: alter table tbl_parquet convert to iceberg
+PREHOOK: type: ALTERTABLE_CONVERT
+PREHOOK: Input: default@tbl_parquet
+POSTHOOK: query: alter table tbl_parquet convert to iceberg
+POSTHOOK: type: ALTERTABLE_CONVERT
 POSTHOOK: Input: default@tbl_parquet
 POSTHOOK: Output: default@tbl_parquet
 PREHOOK: query: describe formatted tbl_parquet
@@ -339,7 +362,13 @@ Table Parameters:
 	EXTERNAL            	TRUE                
 	MIGRATED_TO_ICEBERG 	true                
 	bucketing_version   	2                   
+	current-schema      	{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":false,\"type\":\"int\"},{\"id\":2,\"name\":\"b\",\"required\":false,\"type\":\"string\"}]}
+	current-snapshot-id 	#Masked#
+	current-snapshot-summary	{\"added-data-files\":\"4\",\"added-records\":\"9\",\"added-files-size\":\"#Masked#\",\"changed-partition-count\":\"4\",\"total-records\":\"9\",\"total-files-size\":\"#Masked#\",\"total-data-files\":\"4\",\"total-delete-files\":\"0\",\"total-position-deletes\":\"0\",\"total-equality-deletes\":\"0\"}
+	current-snapshot-timestamp-ms	#Masked#       
+	default-partition-spec	{\"spec-id\":0,\"fields\":[{\"name\":\"b\",\"transform\":\"identity\",\"source-id\":2,\"field-id\":1000}]}
 	engine.hive.enabled 	true                
+	iceberg.orc.files.only	false               
 #### A masked pattern was here ####
 	metadata_location   	hdfs://### HDFS PATH ###
 	numFiles            	4                   
@@ -352,6 +381,7 @@ Table Parameters:
 	                           	  \"field-id\" : 2, 
 	                           	  \"names\" : [ \"b\" ]
 	                           	} ]                 
+	snapshot-count      	1                   
 	storage_handler     	org.apache.iceberg.mr.hive.HiveIcebergStorageHandler
 	table_type          	ICEBERG             
 	totalSize           	#Masked#                
@@ -503,12 +533,20 @@ POSTHOOK: Output: hdfs://### HDFS PATH ###
 7	three
 8	three
 9	four
-PREHOOK: query: alter table tbl_avro set tblproperties ('storage_handler'='org.apache.iceberg.mr.hive.HiveIcebergStorageHandler')
-PREHOOK: type: ALTERTABLE_PROPERTIES
+PREHOOK: query: explain alter table tbl_avro convert to iceberg
+PREHOOK: type: ALTERTABLE_CONVERT
 PREHOOK: Input: default@tbl_avro
-PREHOOK: Output: default@tbl_avro
-POSTHOOK: query: alter table tbl_avro set tblproperties ('storage_handler'='org.apache.iceberg.mr.hive.HiveIcebergStorageHandler')
-POSTHOOK: type: ALTERTABLE_PROPERTIES
+POSTHOOK: query: explain alter table tbl_avro convert to iceberg
+POSTHOOK: type: ALTERTABLE_CONVERT
+POSTHOOK: Input: default@tbl_avro
+Stage-0
+  Convert operation{"table name:":"default.tbl_avro","spec:":"AlterTableConvertSpec{ConvertTo=iceberg, TBLProperties={}}"}
+
+PREHOOK: query: alter table tbl_avro convert to iceberg
+PREHOOK: type: ALTERTABLE_CONVERT
+PREHOOK: Input: default@tbl_avro
+POSTHOOK: query: alter table tbl_avro convert to iceberg
+POSTHOOK: type: ALTERTABLE_CONVERT
 POSTHOOK: Input: default@tbl_avro
 POSTHOOK: Output: default@tbl_avro
 PREHOOK: query: describe formatted tbl_avro
@@ -535,7 +573,13 @@ Table Parameters:
 	EXTERNAL            	TRUE                
 	MIGRATED_TO_ICEBERG 	true                
 	bucketing_version   	2                   
+	current-schema      	{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"a\",\"required\":false,\"type\":\"int\"},{\"id\":2,\"name\":\"b\",\"required\":false,\"type\":\"string\"}]}
+	current-snapshot-id 	#Masked#
+	current-snapshot-summary	{\"added-data-files\":\"4\",\"added-records\":\"9\",\"added-files-size\":\"#Masked#\",\"changed-partition-count\":\"4\",\"total-records\":\"9\",\"total-files-size\":\"#Masked#\",\"total-data-files\":\"4\",\"total-delete-files\":\"0\",\"total-position-deletes\":\"0\",\"total-equality-deletes\":\"0\"}
+	current-snapshot-timestamp-ms	#Masked#       
+	default-partition-spec	{\"spec-id\":0,\"fields\":[{\"name\":\"b\",\"transform\":\"identity\",\"source-id\":2,\"field-id\":1000}]}
 	engine.hive.enabled 	true                
+	iceberg.orc.files.only	false               
 #### A masked pattern was here ####
 	metadata_location   	hdfs://### HDFS PATH ###
 	numFiles            	4                   
@@ -548,6 +592,7 @@ Table Parameters:
 	                           	  \"field-id\" : 2, 
 	                           	  \"names\" : [ \"b\" ]
 	                           	} ]                 
+	snapshot-count      	1                   
 	storage_handler     	org.apache.iceberg.mr.hive.HiveIcebergStorageHandler
 	table_type          	ICEBERG             
 	totalSize           	#Masked#                

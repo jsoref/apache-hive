@@ -161,6 +161,7 @@ import org.apache.hadoop.hive.ql.plan.PartitionDesc;
 import org.apache.hadoop.hive.ql.plan.PlanUtils;
 import org.apache.hadoop.hive.ql.plan.ReduceWork;
 import org.apache.hadoop.hive.ql.plan.TableDesc;
+import org.apache.hadoop.hive.ql.plan.TableScanDesc;
 import org.apache.hadoop.hive.ql.secrets.URISecretSource;
 import org.apache.hadoop.hive.ql.session.SessionState;
 import org.apache.hadoop.hive.ql.stats.StatsFactory;
@@ -256,6 +257,7 @@ public final class Utilities {
   public static final String MAPNAME = "Map ";
   public static final String REDUCENAME = "Reducer ";
   public static final String ENSURE_OPERATORS_EXECUTED = "ENSURE_OPERATORS_EXECUTED";
+  public static final String BRANCH_NAME = "branch_name";
 
   @Deprecated
   protected static final String DEPRECATED_MAPRED_DFSCLIENT_PARALLELISM_MAX = "mapred.dfsclient.parallelism.max";
@@ -761,6 +763,9 @@ public final class Utilities {
     props.put(serdeConstants.SERIALIZATION_LIB, tbl.getDeserializer().getClass().getName());
     if (tbl.getMetaTable() != null) {
       props.put("metaTable", tbl.getMetaTable());
+    }
+    if (tbl.getBranchName() != null) {
+      props.put(BRANCH_NAME, tbl.getBranchName());
     }
     return (new TableDesc(tbl.getInputFormatClass(), tbl
         .getOutputFormatClass(), props));
@@ -1410,7 +1415,7 @@ public final class Utilities {
     }
   }
 
-  public static void mvFileToFinalPath(Path specPath, Configuration hconf,
+  public static void mvFileToFinalPath(Path specPath, String unionSuffix, Configuration hconf,
                                        boolean success, Logger log, DynamicPartitionCtx dpCtx, FileSinkDesc conf,
                                        Reporter reporter) throws IOException,
       HiveException {
@@ -1460,8 +1465,10 @@ public final class Utilities {
         Set<FileStatus> filesKept = new HashSet<>();
         perfLogger.perfLogBegin("FileSinkOperator", "RemoveTempOrDuplicateFiles");
         // remove any tmp file or double-committed output files
-        List<Path> emptyBuckets = Utilities.removeTempOrDuplicateFiles(
-            fs, statuses, dpCtx, conf, hconf, filesKept, false);
+        int dpLevels = dpCtx == null ? 0 : dpCtx.getNumDPCols(),
+            numBuckets = (conf != null && conf.getTable() != null) ? conf.getTable().getNumBuckets() : 0;
+        List<Path> emptyBuckets = removeTempOrDuplicateFiles(
+            fs, statuses, unionSuffix, dpLevels, numBuckets, hconf, null, 0, false, filesKept, false);
         perfLogger.perfLogEnd("FileSinkOperator", "RemoveTempOrDuplicateFiles");
         // create empty buckets if necessary
         if (!emptyBuckets.isEmpty()) {
@@ -1808,15 +1815,14 @@ public final class Utilities {
           if (!path.getName().equals(AcidUtils.baseOrDeltaSubdir(isBaseDir, writeId, writeId, stmtId))) {
             throw new IOException("Unexpected non-MM directory name " + path);
           }
+        }
 
-          Utilities.FILE_OP_LOGGER.trace("removeTempOrDuplicateFiles processing files in MM directory {}", path);
-
-          if (!StringUtils.isEmpty(unionSuffix)) {
-            try {
-              items = fs.listStatus(new Path(path, unionSuffix));
-            } catch (FileNotFoundException e) {
-              continue;
-            }
+        Utilities.FILE_OP_LOGGER.trace("removeTempOrDuplicateFiles processing files in directory {}", path);
+        if (!StringUtils.isEmpty(unionSuffix)) {
+          try {
+            items = fs.listStatus(new Path(path, unionSuffix));
+          } catch (FileNotFoundException e) {
+            continue;
           }
         }
 
@@ -4158,7 +4164,7 @@ public final class Utilities {
       if (!localFs.exists(new Path(path))) {
         throw new RuntimeException("Could not validate jar file " + path + " for class " + clazz);
       }
-      jars.add(path);
+      jars.add(localFs.makeQualified(new Path(path)).toString());
     }
     if (jars.isEmpty()) {
       return;
@@ -4270,6 +4276,34 @@ public final class Utilities {
       conf.set(IOConstants.SCHEMA_EVOLUTION_COLUMNS_TYPES, tableScanOp.getSchemaEvolutionColumnsTypes());
     } else {
       LOG.info("schema.evolution.columns and schema.evolution.columns.types not available");
+    }
+  }
+
+  /**
+   * Sets partition column names to the configuration, if there is available info in the operator.
+   */
+  public static void setPartitionColumnNames(Configuration conf, TableScanOperator tableScanOp) {
+    TableScanDesc scanDesc = tableScanOp.getConf();
+    Table metadata = scanDesc.getTableMetadata();
+    if (metadata == null) {
+      return;
+    }
+    List<FieldSchema> partCols = metadata.getPartCols();
+    if (partCols != null && !partCols.isEmpty()) {
+      conf.set(serdeConstants.LIST_PARTITION_COLUMNS, MetaStoreUtils.getColumnNamesFromFieldSchema(partCols));
+    }
+  }
+
+  /**
+   * Returns a list with partition column names present in the configuration,
+   * or empty if there is no such information available.
+   */
+  public static List<String> getPartitionColumnNames(Configuration conf) {
+    String colNames = conf.get(serdeConstants.LIST_PARTITION_COLUMNS);
+    if (colNames != null) {
+      return splitColNames(new ArrayList<>(), colNames);
+    } else {
+      return Collections.emptyList();
     }
   }
 
@@ -5009,5 +5043,17 @@ public final class Utilities {
   public static boolean arePathsEqualOrWithin(Path p1, Path p2) {
     return ((p1.toString().toLowerCase().indexOf(p2.toString().toLowerCase()) > -1) ||
         (p2.toString().toLowerCase().indexOf(p1.toString().toLowerCase()) > -1)) ? true : false;
+  }
+
+  public static String getTableOrMVSuffix(Context context, boolean createTableOrMVUseSuffix) {
+    String suffix = "";
+    if (createTableOrMVUseSuffix) {
+      long txnId = Optional.ofNullable(context)
+              .map(ctx -> ctx.getHiveTxnManager().getCurrentTxnId()).orElse(0L);
+      if (txnId != 0) {
+        suffix = AcidUtils.getPathSuffix(txnId);
+      }
+    }
+    return suffix;
   }
 }

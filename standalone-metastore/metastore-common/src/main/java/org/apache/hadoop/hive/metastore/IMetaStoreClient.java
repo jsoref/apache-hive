@@ -43,7 +43,7 @@ import org.apache.thrift.TException;
  */
 @InterfaceAudience.Public
 @InterfaceStability.Evolving
-public interface IMetaStoreClient {
+public interface IMetaStoreClient extends AutoCloseable {
 
   /**
    * Returns whether current client is compatible with conf argument or not
@@ -3079,6 +3079,13 @@ public interface IMetaStoreClient {
           throws TException;
 
   /**
+   * Persists minOpenWriteId list to identify obsolete directories eligible for cleanup
+   * @param txnId transaction identifier
+   * @param writeIds list of minOpenWriteId
+   */
+  void addWriteIdsToMinHistory(long txnId, Map<String, Long> writeIds) throws TException;
+    
+  /**
    * Initiate a transaction.
    * @param user User who is opening this transaction.  This is the Hive user,
    *             not necessarily the OS user.  It is assumed that this user has already been
@@ -3149,6 +3156,18 @@ public interface IMetaStoreClient {
    * @throws TException
    */
   void rollbackTxn(long txnid) throws NoSuchTxnException, TException;
+
+  /**
+   * Rollback a transaction.  This will also unlock any locks associated with
+   * this transaction.
+   * @param abortTxnRequest AbortTxnRequest object containing transaction id and
+   * error codes.
+   * @throws NoSuchTxnException if the requested transaction does not exist.
+   * Note that this can result from the transaction having timed out and been
+   * deleted.
+   * @throws TException
+   */
+  void rollbackTxn(AbortTxnRequest abortTxnRequest) throws NoSuchTxnException, TException;
 
   /**
    * Rollback a transaction.  This will also unlock any locks associated with
@@ -3228,6 +3247,14 @@ public interface IMetaStoreClient {
   void abortTxns(List<Long> txnids) throws TException;
 
   /**
+   * Abort a list of transactions with additional information of
+   * errorcodes as defined in TxnErrorMsg.java.
+   * @param abortTxnsRequest Information containing txnIds and error codes
+   * @throws TException
+   */
+  void abortTxns(AbortTxnsRequest abortTxnsRequest) throws TException;
+
+  /**
    * Allocate a per table write ID and associate it with the given transaction.
    * @param txnId id of transaction to which the allocated write ID to be associated.
    * @param dbName name of DB in which the table belongs.
@@ -3235,6 +3262,16 @@ public interface IMetaStoreClient {
    * @throws TException
    */
   long allocateTableWriteId(long txnId, String dbName, String tableName) throws TException;
+
+  /**
+   * Allocate a per table write ID and associate it with the given transaction.
+   * @param txnId id of transaction to which the allocated write ID to be associated.
+   * @param dbName name of DB in which the table belongs.
+   * @param tableName table to which the write ID to be allocated
+   * @param reallocate should we reallocate already mapped writeId (if true) or reuse (if false)
+   * @throws TException
+   */
+  long allocateTableWriteId(long txnId, String dbName, String tableName, boolean reallocate) throws TException;
 
   /**
    * Replicate Table Write Ids state to mark aborted write ids and writeid high water mark.
@@ -3437,10 +3474,15 @@ public interface IMetaStoreClient {
    * @param partitionName Name of the partition to be compacted
    * @param type Whether this is a major or minor compaction.
    * @throws TException
+   * @deprecated use {@link #compact2(CompactionRequest)}
    */
   @Deprecated
   void compact(String dbname, String tableName, String partitionName,  CompactionType type)
       throws TException;
+
+  /**
+   * @deprecated use {@link #compact2(CompactionRequest)}
+   */
   @Deprecated
   void compact(String dbname, String tableName, String partitionName, CompactionType type,
                Map<String, String> tblproperties) throws TException;
@@ -3459,18 +3501,37 @@ public interface IMetaStoreClient {
    * @param tblproperties the list of tblproperties to override for this compact. Can be null.
    * @return id of newly scheduled compaction or id/state of one which is already scheduled/running
    * @throws TException
+   * @deprecated use {@link #compact2(CompactionRequest)}
    */
+  @Deprecated
   CompactionResponse compact2(String dbname, String tableName, String partitionName, CompactionType type,
                               Map<String, String> tblproperties) throws TException;
 
   /**
+   * Send a request to compact a table or partition.  This will not block until the compaction is
+   * complete.  It will instead put a request on the queue for that table or partition to be
+   * compacted.  No checking is done on the dbname, tableName, or partitionName to make sure they
+   * refer to valid objects.  It is assumed this has already been done by the caller.  At most one
+   * Compaction can be scheduled/running for any given resource at a time.
+   * @param request The {@link CompactionRequest} object containing the details required to enqueue
+   *                a compaction request.
+   * @throws TException
+   */
+  CompactionResponse compact2(CompactionRequest request) throws TException;
+
+  /**
    * Get a list of all compactions.
-   * @return List of all current compactions.  This includes compactions waiting to happen,
+   * @return List of all current compactions. This includes compactions waiting to happen,
    * in progress, and finished but waiting to clean the existing files.
    * @throws TException
    */
   ShowCompactResponse showCompactions() throws TException;
-
+  
+  /**
+   * Get a list of compactions for the given request object.
+   */
+  ShowCompactResponse showCompactions(ShowCompactRequest request) throws TException;
+  
   /**
    * Submit a request for performing cleanup of output directory. This is particularly
    * useful for CTAS when the query fails after write and before creation of table.
@@ -3527,6 +3588,11 @@ public interface IMetaStoreClient {
    */
   void insertTable(Table table, boolean overwrite) throws MetaException;
 
+  /**
+   * Checks if there is a conflicting transaction
+   * @param txnId
+   * @return latest txnId in conflict
+   */
   long getLatestTxnIdInConflict(long txnId) throws TException;
 
   /**
@@ -4324,4 +4390,30 @@ public interface IMetaStoreClient {
    * @throws TException
    */
   List<WriteEventInfo> getAllWriteEventInfo(GetAllWriteEventInfoRequest request) throws TException;
+
+  AbortCompactResponse abortCompactions(AbortCompactionRequest request) throws TException;
+
+  /**
+   * Sets properties.
+   * @param nameSpace the property store namespace
+   * @param properties a map keyed by property path mapped to property values
+   * @return true if successful, false otherwise
+   * @throws TException
+   */
+  default boolean setProperties(String nameSpace, Map<String, String> properties) throws TException {
+    throw new UnsupportedOperationException();
+  }
+
+  /**
+   * Gets properties.
+   * @param nameSpace the property store namespace.
+   * @param mapPrefix the map prefix (ala starts-with) to select maps
+   * @param mapPredicate predicate expression on properties to further reduce the selected maps
+   * @param selection the list of properties to return, null for all
+   * @return a map keyed by property map path to maps keyed by property name mapped to property values
+   * @throws TException
+   */
+  default Map<String, Map<String, String>> getProperties(String nameSpace, String mapPrefix, String mapPredicate, String... selection) throws TException {
+    throw new UnsupportedOperationException();
+  };
 }

@@ -22,7 +22,6 @@ import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.common.FileUtils;
-import org.apache.hadoop.hive.common.StringableMap;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.metastore.HiveMetaStoreUtils;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
@@ -41,6 +40,7 @@ import org.apache.hadoop.hive.metastore.api.TxnInfo;
 import org.apache.hadoop.hive.metastore.api.TxnState;
 import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 import org.apache.hadoop.hive.metastore.txn.TxnStore;
+import org.apache.hadoop.hive.metastore.utils.StringableMap;
 import org.apache.hadoop.hive.ql.io.AcidUtils;
 import org.junit.After;
 import org.junit.Assert;
@@ -74,6 +74,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.powermock.api.mockito.PowerMockito.when;
 
 /**
  * Tests for the worker thread and its MR jobs.
@@ -131,19 +132,19 @@ public class TestWorker extends CompactorTest {
   @Test
   public void stringableList() throws Exception {
     // Empty list case
-    CompactorMR.StringableList ls = new CompactorMR.StringableList();
+    MRCompactor.StringableList ls = new MRCompactor.StringableList();
     String s = ls.toString();
     Assert.assertEquals("0:", s);
-    ls = new CompactorMR.StringableList(s);
+    ls = new MRCompactor.StringableList(s);
     Assert.assertEquals(0, ls.size());
 
-    ls = new CompactorMR.StringableList();
+    ls = new MRCompactor.StringableList();
     ls.add(new Path("/tmp"));
     ls.add(new Path("/usr"));
     s = ls.toString();
     Assert.assertTrue("Expected 2:4:/tmp4:/usr or 2:4:/usr4:/tmp, got " + s,
         "2:4:/tmp4:/usr".equals(s) || "2:4:/usr4:/tmp".equals(s));
-    ls = new CompactorMR.StringableList(s);
+    ls = new MRCompactor.StringableList(s);
     Assert.assertEquals(2, ls.size());
     boolean sawTmp = false, sawUsr = false;
     for (Path p : ls) {
@@ -177,8 +178,8 @@ public class TestWorker extends CompactorTest {
     deltas[0] = new Path(delta1);
     deltas[1] = new Path(delta2);
 
-    CompactorMR.CompactorInputSplit split =
-        new CompactorMR.CompactorInputSplit(conf, 3, files, new Path(basename), deltas, new HashMap<String, Integer>());
+    MRCompactor.CompactorInputSplit split =
+        new MRCompactor.CompactorInputSplit(conf, 3, files, new Path(basename), deltas, new HashMap<String, Integer>());
 
     Assert.assertEquals(520L, split.getLength());
     String[] locations = split.getLocations();
@@ -189,7 +190,7 @@ public class TestWorker extends CompactorTest {
     DataOutput out = new DataOutputStream(buf);
     split.write(out);
 
-    split = new CompactorMR.CompactorInputSplit();
+    split = new MRCompactor.CompactorInputSplit();
     DataInput in = new DataInputStream(new ByteArrayInputStream(buf.toByteArray()));
     split.readFields(in);
 
@@ -222,14 +223,14 @@ public class TestWorker extends CompactorTest {
     deltas[0] = new Path(delta1);
     deltas[1] = new Path(delta2);
 
-    CompactorMR.CompactorInputSplit split =
-        new CompactorMR.CompactorInputSplit(conf, 3, files, null, deltas, new HashMap<String, Integer>());
+    MRCompactor.CompactorInputSplit split =
+        new MRCompactor.CompactorInputSplit(conf, 3, files, null, deltas, new HashMap<String, Integer>());
 
     ByteArrayOutputStream buf = new ByteArrayOutputStream();
     DataOutput out = new DataOutputStream(buf);
     split.write(out);
 
-    split = new CompactorMR.CompactorInputSplit();
+    split = new MRCompactor.CompactorInputSplit();
     DataInput in = new DataInputStream(new ByteArrayInputStream(buf.toByteArray()));
     split.readFields(in);
 
@@ -324,7 +325,7 @@ public class TestWorker extends CompactorTest {
     for (int i = 0; i < stat.length; i++) {
       if (stat[i].getPath().getName().equals(makeDeltaDirNameCompacted(21, 24) + "_v0000026")) {
         sawNewDelta = true;
-        FileStatus[] buckets = fs.listStatus(stat[i].getPath(), AcidUtils.hiddenFileFilter);
+        FileStatus[] buckets = fs.listStatus(stat[i].getPath(), FileUtils.HIDDEN_FILES_PATH_FILTER);
         Assert.assertEquals(2, buckets.length);
         Assert.assertTrue(buckets[0].getPath().getName().matches("bucket_0000[01]"));
         Assert.assertTrue(buckets[1].getPath().getName().matches("bucket_0000[01]"));
@@ -333,7 +334,7 @@ public class TestWorker extends CompactorTest {
       }
       if (stat[i].getPath().getName().equals(makeDeleteDeltaDirNameCompacted(21, 24) + "_v0000026")) {
         sawNewDelta = true;
-        FileStatus[] buckets = fs.listStatus(stat[i].getPath(), AcidUtils.hiddenFileFilter);
+        FileStatus[] buckets = fs.listStatus(stat[i].getPath(), FileUtils.HIDDEN_FILES_PATH_FILTER);
         Assert.assertEquals(2, buckets.length);
         Assert.assertTrue(buckets[0].getPath().getName().matches("bucket_0000[01]"));
         Assert.assertTrue(buckets[1].getPath().getName().matches("bucket_0000[01]"));
@@ -456,7 +457,7 @@ public class TestWorker extends CompactorTest {
     for (int i = 0; i < stat.length; i++) {
       if (stat[i].getPath().getName().equals(makeDeltaDirNameCompacted(21, 24) + "_v0000026")) {
         sawNewDelta = true;
-        FileStatus[] buckets = fs.listStatus(stat[i].getPath(), AcidUtils.hiddenFileFilter);
+        FileStatus[] buckets = fs.listStatus(stat[i].getPath(), FileUtils.HIDDEN_FILES_PATH_FILTER);
         Assert.assertEquals(2, buckets.length);
         Assert.assertTrue(buckets[0].getPath().getName().matches("bucket_0000[01]"));
         Assert.assertTrue(buckets[1].getPath().getName().matches("bucket_0000[01]"));
@@ -465,7 +466,7 @@ public class TestWorker extends CompactorTest {
       }
       if (stat[i].getPath().getName().equals(makeDeleteDeltaDirNameCompacted(21, 24))) {
         sawNewDelta = true;
-        FileStatus[] buckets = fs.listStatus(stat[i].getPath(), AcidUtils.hiddenFileFilter);
+        FileStatus[] buckets = fs.listStatus(stat[i].getPath(), FileUtils.HIDDEN_FILES_PATH_FILTER);
         Assert.assertEquals(2, buckets.length);
         Assert.assertTrue(buckets[0].getPath().getName().matches("bucket_0000[01]"));
         Assert.assertTrue(buckets[1].getPath().getName().matches("bucket_0000[01]"));
@@ -508,7 +509,7 @@ public class TestWorker extends CompactorTest {
     for (int i = 0; i < stat.length; i++) {
       if (stat[i].getPath().getName().equals(makeDeltaDirNameCompacted(1, 4) + "_v0000006")) {
         sawNewDelta = true;
-        FileStatus[] buckets = fs.listStatus(stat[i].getPath(), AcidUtils.hiddenFileFilter);
+        FileStatus[] buckets = fs.listStatus(stat[i].getPath(), FileUtils.HIDDEN_FILES_PATH_FILTER);
         Assert.assertEquals(2, buckets.length);
         Assert.assertTrue(buckets[0].getPath().getName().matches("bucket_0000[01]"));
         Assert.assertTrue(buckets[1].getPath().getName().matches("bucket_0000[01]"));
@@ -517,7 +518,7 @@ public class TestWorker extends CompactorTest {
       }
       if (stat[i].getPath().getName().equals(makeDeleteDeltaDirNameCompacted(1, 4) + "_v0000006")) {
         sawNewDelta = true;
-        FileStatus[] buckets = fs.listStatus(stat[i].getPath(), AcidUtils.hiddenFileFilter);
+        FileStatus[] buckets = fs.listStatus(stat[i].getPath(), FileUtils.HIDDEN_FILES_PATH_FILTER);
         Assert.assertEquals(2, buckets.length);
         Assert.assertTrue(buckets[0].getPath().getName().matches("bucket_0000[01]"));
         Assert.assertTrue(buckets[1].getPath().getName().matches("bucket_0000[01]"));
@@ -840,7 +841,7 @@ public class TestWorker extends CompactorTest {
     for (int i = 0; i < stat.length; i++) {
       if (stat[i].getPath().getName().equals(makeDeltaDirNameCompacted(21, 24) + "_v0000026")) {
         sawNewDelta = true;
-        FileStatus[] buckets = fs.listStatus(stat[i].getPath(), AcidUtils.hiddenFileFilter);
+        FileStatus[] buckets = fs.listStatus(stat[i].getPath(), FileUtils.HIDDEN_FILES_PATH_FILTER);
         Assert.assertEquals(2, buckets.length);
         Assert.assertTrue(buckets[0].getPath().getName().matches("bucket_0000[01]"));
         Assert.assertTrue(buckets[1].getPath().getName().matches("bucket_0000[01]"));
@@ -1027,6 +1028,33 @@ public class TestWorker extends CompactorTest {
   }
 
   @Test
+  public void testDoesNotGatherStatsIfCompactionFails() throws Exception {
+    StatsUpdater statsUpdater = Mockito.mock(StatsUpdater.class);
+
+    Table t = newTable("default", "mtwb", false);
+
+    addBaseFile(t, null, 20L, 20);
+    addDeltaFile(t, null, 21L, 22L, 2);
+    addDeltaFile(t, null, 23L, 24L, 2);
+
+    burnThroughTransactions("default", "mtwb", 25);
+
+    txnHandler.compact(new CompactionRequest("default", "mtwb", CompactionType.MINOR));
+
+    CompactorFactory mockedFactory = Mockito.mock(CompactorFactory.class);
+    when(mockedFactory.getCompactorPipeline(any(), any(), any(), any())).thenThrow(new RuntimeException());
+
+    Worker worker = Mockito.spy(new Worker(mockedFactory));
+    worker.setConf(conf);
+    worker.init(new AtomicBoolean(true));
+    Worker.statsUpdater = statsUpdater;
+
+    worker.findNextCompactionAndExecute(true, true);
+
+    Mockito.verify(statsUpdater, Mockito.never()).gatherStats(any(), any(), any(), any(), any());
+  }
+
+  @Test
   public void droppedTable() throws Exception {
     Table t = newTable("default", "dt", false);
 
@@ -1152,19 +1180,19 @@ public class TestWorker extends CompactorTest {
   }
 
   // With high timeout, but fast run we should finish without a problem
-  @Test(timeout=1000)
+  @Test(timeout=2000)
   public void testNormalRun() throws Exception {
     runTimeoutTest(10000, false, true);
   }
 
   // With low timeout, but slow run we should finish without a problem
-  @Test(timeout=1000)
+  @Test(timeout=2000)
   public void testTimeoutWithInterrupt() throws Exception {
     runTimeoutTest(1, true, false);
   }
 
   // With low timeout, but slow run we should finish without a problem, even if the interrupt is swallowed
-  @Test(timeout=1000)
+  @Test(timeout=2000)
   public void testTimeoutWithoutInterrupt() throws Exception {
     runTimeoutTest(1, true, true);
   }
@@ -1173,6 +1201,8 @@ public class TestWorker extends CompactorTest {
     ExecutorService executor = Executors.newSingleThreadExecutor();
     HiveConf timeoutConf = new HiveConf(conf);
     timeoutConf.setTimeVar(HiveConf.ConfVars.HIVE_COMPACTOR_WORKER_TIMEOUT, timeout, TimeUnit.MILLISECONDS);
+    timeoutConf.setTimeVar(HiveConf.ConfVars.HIVE_COMPACTOR_WORKER_SLEEP_TIME, 20, TimeUnit.MILLISECONDS);
+    timeoutConf.setTimeVar(HiveConf.ConfVars.HIVE_COMPACTOR_WORKER_MAX_SLEEP_TIME, 20, TimeUnit.MILLISECONDS);
 
     TimeoutWorker timeoutWorker = getTimeoutWorker(timeoutConf, executor,
         runForever, swallowInterrupt, new CountDownLatch(2));

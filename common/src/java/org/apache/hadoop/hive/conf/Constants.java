@@ -17,6 +17,8 @@
  */
 package org.apache.hadoop.hive.conf;
 
+import java.util.regex.Pattern;
+
 public class Constants {
   /* Constants for Hive stats */
   public static final String HIVE_ENGINE = "hive";
@@ -93,4 +95,21 @@ public class Constants {
   public static final String INSERT_ONLY_FETCH_BUCKET_ID = "insertonly.fetch.bucketid";
 
   public static final String ERROR_MESSAGE_NO_DETAILS_AVAILABLE = "No detailed message available";
+
+  public static final String ORC_INPUT_FORMAT = "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat";
+  public static final String ORC_OUTPUT_FORMAT = "org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat";
+
+
+  public static final Pattern COMPACTION_POOLS_PATTERN = Pattern.compile("hive\\.compactor\\.worker\\.(.*)\\.threads");
+  public static final String HIVE_COMPACTOR_WORKER_POOL = "hive.compactor.worker.pool";
+  public static final String HIVE_COMPACTOR_REBALANCE_ORDERBY = "hive.compactor.rebalance.orderby";
+
+  public static final String HTTP_HEADER_REQUEST_TRACK = "X-Request-ID";
+  public static final String TIME_POSTFIX_REQUEST_TRACK = "_TIME";
+
+  public static final String ICEBERG = "iceberg";
+  public static final String ICEBERG_PARTITION_TABLE_SCHEMA = "partition,spec_id,record_count,file_count," +
+      "position_delete_record_count,position_delete_file_count,equality_delete_record_count," +
+      "equality_delete_file_count";
+  public static final String DELIMITED_JSON_SERDE = "org.apache.hadoop.hive.serde2.DelimitedJSONSerDe";
 }

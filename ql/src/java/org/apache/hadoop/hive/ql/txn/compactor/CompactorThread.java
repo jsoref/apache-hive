@@ -61,6 +61,12 @@ public abstract class CompactorThread extends Thread implements Configurable {
   protected String hostName;
   protected String runtimeVersion;
 
+  //Time threshold for compactor thread log
+  //In milliseconds:
+  private static final Integer MAX_WARN_LOG_TIME = 1200000; //20 min
+
+  protected long checkInterval = 0;
+
   @Override
   public void setConf(Configuration configuration) {
     // TODO MS-SPLIT for now, keep a copy of HiveConf around as we need to call other methods with
@@ -78,10 +84,16 @@ public abstract class CompactorThread extends Thread implements Configurable {
 
   public void init(AtomicBoolean stop) throws Exception {
     setPriority(MIN_PRIORITY);
-    setDaemon(true); // this means the process will exit without waiting for this thread
+    setDaemon(false);
     this.stop = stop;
     this.hostName = ServerUtils.hostname();
     this.runtimeVersion = getRuntimeVersion();
+  }
+
+  protected void checkInterrupt() throws InterruptedException {
+    if (Thread.interrupted()) {
+      throw new InterruptedException(getClass().getName() + " execution is interrupted.");
+    }
   }
 
   /**
@@ -196,7 +208,7 @@ public abstract class CompactorThread extends Thread implements Configurable {
   protected String getRuntimeVersion() {
     return this.getClass().getPackage().getImplementationVersion();
   }
-  
+
   protected LockRequest createLockRequest(CompactionInfo ci, long txnId, LockType lockType, DataOperationType opType) {
     String agentInfo = Thread.currentThread().getName();
     LockRequestBuilder requestBuilder = new LockRequestBuilder(agentInfo);
@@ -218,5 +230,19 @@ public abstract class CompactorThread extends Thread implements Configurable {
     requestBuilder.setZeroWaitReadEnabled(!conf.getBoolVar(HiveConf.ConfVars.TXN_OVERWRITE_X_LOCK) ||
       !conf.getBoolVar(HiveConf.ConfVars.TXN_WRITE_X_LOCK));
     return requestBuilder.build();
+  }
+
+  protected void doPostLoopActions(long elapsedTime) throws InterruptedException {
+    String threadTypeName = getClass().getName();
+    if (elapsedTime < checkInterval && !stop.get()) {
+      Thread.sleep(checkInterval - elapsedTime);
+    }
+
+    if (elapsedTime < MAX_WARN_LOG_TIME) {
+      LOG.debug("{} loop took {} seconds to finish.", threadTypeName, elapsedTime/1000);
+    } else {
+      LOG.warn("Possible {} slowdown, loop took {} seconds to finish.", threadTypeName, elapsedTime/1000);
+    }
+
   }
 }

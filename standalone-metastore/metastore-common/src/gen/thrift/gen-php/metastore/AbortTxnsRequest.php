@@ -30,18 +30,30 @@ class AbortTxnsRequest
                 'type' => TType::I64,
                 ),
         ),
+        2 => array(
+            'var' => 'errorCode',
+            'isRequired' => false,
+            'type' => TType::I64,
+        ),
     );
 
     /**
      * @var int[]
      */
     public $txn_ids = null;
+    /**
+     * @var int
+     */
+    public $errorCode = null;
 
     public function __construct($vals = null)
     {
         if (is_array($vals)) {
             if (isset($vals['txn_ids'])) {
                 $this->txn_ids = $vals['txn_ids'];
+            }
+            if (isset($vals['errorCode'])) {
+                $this->errorCode = $vals['errorCode'];
             }
         }
     }
@@ -68,15 +80,22 @@ class AbortTxnsRequest
                 case 1:
                     if ($ftype == TType::LST) {
                         $this->txn_ids = array();
-                        $_size654 = 0;
-                        $_etype657 = 0;
-                        $xfer += $input->readListBegin($_etype657, $_size654);
-                        for ($_i658 = 0; $_i658 < $_size654; ++$_i658) {
-                            $elem659 = null;
-                            $xfer += $input->readI64($elem659);
-                            $this->txn_ids []= $elem659;
+                        $_size688 = 0;
+                        $_etype691 = 0;
+                        $xfer += $input->readListBegin($_etype691, $_size688);
+                        for ($_i692 = 0; $_i692 < $_size688; ++$_i692) {
+                            $elem693 = null;
+                            $xfer += $input->readI64($elem693);
+                            $this->txn_ids []= $elem693;
                         }
                         $xfer += $input->readListEnd();
+                    } else {
+                        $xfer += $input->skip($ftype);
+                    }
+                    break;
+                case 2:
+                    if ($ftype == TType::I64) {
+                        $xfer += $input->readI64($this->errorCode);
                     } else {
                         $xfer += $input->skip($ftype);
                     }
@@ -101,10 +120,15 @@ class AbortTxnsRequest
             }
             $xfer += $output->writeFieldBegin('txn_ids', TType::LST, 1);
             $output->writeListBegin(TType::I64, count($this->txn_ids));
-            foreach ($this->txn_ids as $iter660) {
-                $xfer += $output->writeI64($iter660);
+            foreach ($this->txn_ids as $iter694) {
+                $xfer += $output->writeI64($iter694);
             }
             $output->writeListEnd();
+            $xfer += $output->writeFieldEnd();
+        }
+        if ($this->errorCode !== null) {
+            $xfer += $output->writeFieldBegin('errorCode', TType::I64, 2);
+            $xfer += $output->writeI64($this->errorCode);
             $xfer += $output->writeFieldEnd();
         }
         $xfer += $output->writeFieldStop();

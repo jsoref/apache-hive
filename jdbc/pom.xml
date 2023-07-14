@@ -17,7 +17,7 @@
   <parent>
     <groupId>org.apache.hive</groupId>
     <artifactId>hive</artifactId>
-    <version>4.0.0-alpha-2-SNAPSHOT</version>
+    <version>4.0.0-beta-1-SNAPSHOT</version>
     <relativePath>../pom.xml</relativePath>
   </parent>
   <artifactId>hive-jdbc</artifactId>
@@ -202,14 +202,21 @@
                     <filter>
                       <artifact>*:*</artifact>
                       <excludes>
+                        <!--
+                        Shading signed JARs will fail without this.
+                        http://stackoverflow.com/questions/999489/invalid-signature-file-when-attempting-to-run-a-jar
+                        -->
                         <exclude>META-INF/*.SF</exclude>
                         <exclude>META-INF/*.DSA</exclude>
                         <exclude>META-INF/*.RSA</exclude>
+                        <!-- Exclude irrelevant webapp files of dependencies. -->
                         <exclude>core-default.xml</exclude>
                         <exclude>webapps/</exclude>
                         <exclude>hive-webapps/</exclude>
                         <exclude>hbase-webapps/</exclude>
                         <exclude>static/</exclude>
+                        <!-- Exclude dependency module descriptors, which would be incorrect in a Hive jar. -->
+                        <exclude>META-INF/versions/*/module-info.class</exclude>
                       </excludes>
                     </filter>
                   </filters>
@@ -218,6 +225,7 @@
                       <exclude>antlr:*</exclude>
                       <exclude>aopalliance:*</exclude>
                       <exclude>asm:*</exclude>
+                      <exclude>ch.qos.reload4j:*</exclude>
                       <exclude>com.fasterxml.jackson.core:*</exclude>
                       <exclude>com.google.code.gson:*</exclude>
                       <exclude>com.google.inject:*</exclude>
@@ -303,6 +311,7 @@
                       <exclude>org.htrace:*</exclude>
                       <exclude>org.ow2.asm:*</exclude>
                       <exclude>org.slf4j:slf4j-log4j12</exclude>
+                      <exclude>org.slf4j:slf4j-reload4j</exclude>
                       <exclude>org.tukaani:*</exclude>
                       <exclude>org.xerial.snappy:*</exclude>
                       <exclude>tomcat:*</exclude>

@@ -18,6 +18,7 @@
 
 package org.apache.hadoop.hive.ql.session;
 import static org.apache.hadoop.hive.metastore.Warehouse.DEFAULT_DATABASE_NAME;
+import static org.apache.hadoop.hive.shims.HadoopShims.USER_ID;
 
 import java.io.Closeable;
 import java.io.File;
@@ -254,8 +255,8 @@ public class SessionState implements ISessionAuthState{
 
   private String currentCatalog;
 
-  private final String CONFIG_AUTHZ_SETTINGS_APPLIED_MARKER =
-      "hive.internal.ss.authz.settings.applied.marker";
+  private static final String CONFIG_AUTHZ_SETTINGS_APPLIED_MARKER =
+      "_hive.ss.authz.settings.applied.marker";
 
   private String userIpAddress;
 
@@ -470,7 +471,7 @@ public class SessionState implements ISessionAuthState{
     killQuery = new NullKillQuery();
     this.cleanupService = cleanupService;
 
-    ShimLoader.getHadoopShims().setHadoopSessionContext(getSessionId());
+    ShimLoader.getHadoopShims().setHadoopSessionContext(String.format(USER_ID, getSessionId(), userName));
   }
 
   public Map<String, String> getHiveVariables() {
@@ -1091,7 +1092,7 @@ public class SessionState implements ISessionAuthState{
   public static Registry getRegistryForWrite() {
     Registry registry = getRegistry();
     if (registry == null) {
-      throw new RuntimeException("Function registery for session is not initialized");
+      throw new RuntimeException("Function registry for session is not initialized");
     }
     return registry;
   }

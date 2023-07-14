@@ -44,7 +44,9 @@ public class AcidHouseKeeperService implements MetastoreTaskThread {
   @Override
   public void setConf(Configuration configuration) {
     conf = configuration;
-    isCompactorEnabled = MetastoreConf.getBoolVar(conf, MetastoreConf.ConfVars.COMPACTOR_INITIATOR_ON);
+    isCompactorEnabled =
+        MetastoreConf.getBoolVar(conf, MetastoreConf.ConfVars.COMPACTOR_INITIATOR_ON) || MetastoreConf.getBoolVar(conf,
+            MetastoreConf.ConfVars.COMPACTOR_CLEANER_ON);
     txnHandler = TxnUtils.getTxnStore(conf);
   }
 
@@ -80,8 +82,8 @@ public class AcidHouseKeeperService implements MetastoreTaskThread {
     performTask(txnHandler::performTimeOuts, "Cleaning timed out txns and locks");
     performTask(txnHandler::performWriteSetGC, "Cleaning obsolete write set entries");
     performTask(txnHandler::cleanTxnToWriteIdTable, "Cleaning obsolete TXN_TO_WRITE_ID entries");
-    performTask(txnHandler::removeDuplicateCompletedTxnComponents, "Cleaning duplicate COMPLETED_TXN_COMPONENTS entries");
     if (isCompactorEnabled) {
+      performTask(txnHandler::removeDuplicateCompletedTxnComponents, "Cleaning duplicate COMPLETED_TXN_COMPONENTS entries");
       performTask(txnHandler::purgeCompactionHistory, "Cleaning obsolete compaction history entries");
     }
   }

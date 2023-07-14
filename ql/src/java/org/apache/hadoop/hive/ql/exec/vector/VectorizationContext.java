@@ -644,7 +644,9 @@ import com.google.common.annotations.VisibleForTesting;
     udfsNeedingImplicitDecimalCast.add(UDFLog2.class);
     udfsNeedingImplicitDecimalCast.add(UDFSin.class);
     udfsNeedingImplicitDecimalCast.add(UDFAsin.class);
+    udfsNeedingImplicitDecimalCast.add(UDFSinh.class);
     udfsNeedingImplicitDecimalCast.add(UDFCos.class);
+    udfsNeedingImplicitDecimalCast.add(UDFCosh.class);
     udfsNeedingImplicitDecimalCast.add(UDFAcos.class);
     udfsNeedingImplicitDecimalCast.add(UDFLog10.class);
     udfsNeedingImplicitDecimalCast.add(UDFLog.class);
@@ -653,6 +655,7 @@ import com.google.common.annotations.VisibleForTesting;
     udfsNeedingImplicitDecimalCast.add(UDFRadians.class);
     udfsNeedingImplicitDecimalCast.add(UDFAtan.class);
     udfsNeedingImplicitDecimalCast.add(UDFTan.class);
+    udfsNeedingImplicitDecimalCast.add(UDFTanh.class);
     udfsNeedingImplicitDecimalCast.add(UDFOPLongDivide.class);
   }
 
@@ -2834,6 +2837,9 @@ import com.google.common.annotations.VisibleForTesting;
   private VectorExpression getInExpression(List<ExprNodeDesc> childExpr,
       VectorExpressionDescriptor.Mode mode, TypeInfo returnType) throws HiveException {
     ExprNodeDesc colExpr = childExpr.get(0);
+    if (colExpr instanceof ExprNodeConstantDesc) {
+      return null;
+    }
     List<ExprNodeDesc> inChildren = childExpr.subList(1, childExpr.size());
 
     String colType = colExpr.getTypeString();
@@ -3317,8 +3323,12 @@ import com.google.common.annotations.VisibleForTesting;
             returnType, DataTypePhysicalVariation.NONE);
       }
     } else if (isStringFamily(inputType)) {
+      DataTypePhysicalVariation dataTypePhysicalVariation =
+          tryDecimal64Cast && ((DecimalTypeInfo) returnType).precision() <= 18 ?
+              DataTypePhysicalVariation.DECIMAL_64 : 
+              DataTypePhysicalVariation.NONE;
       return createVectorExpression(CastStringToDecimal.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
-          returnType, DataTypePhysicalVariation.NONE);
+          returnType, dataTypePhysicalVariation);
     } else if (inputType.equals("timestamp")) {
       return createVectorExpression(CastTimestampToDecimal.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
           returnType, DataTypePhysicalVariation.NONE);

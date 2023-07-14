@@ -77,8 +77,16 @@ public class DatabaseProduct implements Configurable {
       Configuration conf) {
     DbType dbt;
 
+    Preconditions.checkNotNull(conf, "Configuration is null");
+    // Check if we are using an external database product
+    boolean isExternal = MetastoreConf.getBoolVar(conf, ConfVars.USE_CUSTOM_RDBMS);
+
     if (theDatabaseProduct != null) {
-      Preconditions.checkState(theDatabaseProduct.dbType == getDbType(productName));
+      dbt = getDbType(productName);
+      if (isExternal) {
+        dbt = DbType.CUSTOM;
+      }
+      Preconditions.checkState(theDatabaseProduct.dbType == dbt);
       return theDatabaseProduct;
     }
 
@@ -93,10 +101,6 @@ public class DatabaseProduct implements Configurable {
 
       // Check for null again in case of race condition
       if (theDatabaseProduct == null) {
-        Preconditions.checkNotNull(conf, "Configuration is null");
-        // Check if we are using an external database product
-        boolean isExternal = MetastoreConf.getBoolVar(conf, ConfVars.USE_CUSTOM_RDBMS);
-
         if (isExternal) {
           // The DatabaseProduct will be created by instantiating an external class via
           // reflection. The external class can override any method in the current class
@@ -240,6 +244,14 @@ public class DatabaseProduct implements Configurable {
       return "TO_DATE(" + tableValue + ", 'YYYY-MM-DD')";
     } else {
       return "cast(" + tableValue + " as date)";
+    }
+  }
+
+  protected String toTimestamp(String tableValue) {
+    if (isORACLE()) {
+      return "TO_TIMESTAMP(" + tableValue + ", 'YYYY-MM-DD HH:mm:ss')";
+    } else {
+      return "cast(" + tableValue + " as TIMESTAMP)";
     }
   }
 
@@ -677,6 +689,48 @@ public class DatabaseProduct implements Configurable {
       break;
     }
     return map;
+  }
+
+  /**
+   * Gets the multiple row insert query for the given table with specified columns and row format
+   * @param tableName table name to be used in query
+   * @param columns comma separated column names string
+   * @param rowFormat values format string used in the insert query. Format is like (?,?...?) and the number of
+   *                  question marks in the format is equal to number of column names in the columns argument
+   * @param batchCount number of rows in the query
+   * @return database specific multiple row insert query
+   */
+  public String getBatchInsertQuery(String tableName, String columns, String rowFormat, int batchCount) {
+    StringBuilder sb = new StringBuilder();
+    String fixedPart = tableName + " " + columns + " values ";
+    String row;
+    if (isORACLE()) {
+      sb.append("insert all ");
+      row = "into " + fixedPart + rowFormat + " ";
+    } else {
+      sb.append("insert into " + fixedPart);
+      row = rowFormat + ',';
+    }
+    for (int i = 0; i < batchCount; i++) {
+      sb.append(row);
+    }
+    if (isORACLE()) {
+      sb.append("select * from dual ");
+    }
+    sb.setLength(sb.length() - 1);
+    return sb.toString();
+  }
+
+  /**
+   * Gets the boolean value specific to database for the given input
+   * @param val boolean value
+   * @return database specific value
+   */
+  public Object getBoolean(boolean val) {
+    if (isDERBY()) {
+      return val ? "Y" : "N";
+    }
+    return val;
   }
 
   // This class implements the Configurable interface for the benefit

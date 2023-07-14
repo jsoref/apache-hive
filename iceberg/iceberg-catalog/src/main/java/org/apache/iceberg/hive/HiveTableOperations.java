@@ -19,40 +19,31 @@
 
 package org.apache.iceberg.hive;
 
-import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
-import java.net.InetAddress;
-import java.net.UnknownHostException;
 import java.util.Collections;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.common.StatsSetupConst;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.InvalidObjectException;
-import org.apache.hadoop.hive.metastore.api.LockComponent;
-import org.apache.hadoop.hive.metastore.api.LockLevel;
-import org.apache.hadoop.hive.metastore.api.LockRequest;
-import org.apache.hadoop.hive.metastore.api.LockResponse;
-import org.apache.hadoop.hive.metastore.api.LockState;
-import org.apache.hadoop.hive.metastore.api.LockType;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
 import org.apache.hadoop.hive.metastore.api.SerDeInfo;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
+import org.apache.hive.iceberg.com.fasterxml.jackson.core.JsonProcessingException;
 import org.apache.iceberg.BaseMetastoreTableOperations;
 import org.apache.iceberg.ClientPool;
+import org.apache.iceberg.PartitionSpecParser;
+import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotSummary;
+import org.apache.iceberg.SortOrderParser;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
@@ -64,12 +55,13 @@ import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.hadoop.ConfigProperties;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.BiMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableBiMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
-import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
-import org.apache.iceberg.util.Tasks;
+import org.apache.iceberg.util.JsonUtil;
+import org.apache.parquet.hadoop.ParquetOutputFormat;
 import org.apache.thrift.TException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -82,32 +74,22 @@ import static org.apache.iceberg.TableProperties.GC_ENABLED;
  */
 public class HiveTableOperations extends BaseMetastoreTableOperations {
   private static final Logger LOG = LoggerFactory.getLogger(HiveTableOperations.class);
-
-  private static final String HIVE_ACQUIRE_LOCK_TIMEOUT_MS = "iceberg.hive.lock-timeout-ms";
-  private static final String HIVE_LOCK_CHECK_MIN_WAIT_MS = "iceberg.hive.lock-check-min-wait-ms";
-  private static final String HIVE_LOCK_CHECK_MAX_WAIT_MS = "iceberg.hive.lock-check-max-wait-ms";
   private static final String HIVE_ICEBERG_METADATA_REFRESH_MAX_RETRIES = "iceberg.hive.metadata-refresh-max-retries";
-  private static final String HIVE_TABLE_LEVEL_LOCK_EVICT_MS = "iceberg.hive.table-level-lock-evict-ms";
-  private static final long HIVE_ACQUIRE_LOCK_TIMEOUT_MS_DEFAULT = 3 * 60 * 1000; // 3 minutes
-  private static final long HIVE_LOCK_CHECK_MIN_WAIT_MS_DEFAULT = 50; // 50 milliseconds
-  private static final long HIVE_LOCK_CHECK_MAX_WAIT_MS_DEFAULT = 5 * 1000; // 5 seconds
   private static final int HIVE_ICEBERG_METADATA_REFRESH_MAX_RETRIES_DEFAULT = 2;
-  private static final long HIVE_TABLE_LEVEL_LOCK_EVICT_MS_DEFAULT = TimeUnit.MINUTES.toMillis(10);
+
+  // the max size is based on HMS backend database. For Hive versions below 2.3, the max table parameter size is 4000
+  // characters, see https://issues.apache.org/jira/browse/HIVE-12274
+  // set to 0 to not expose Iceberg metadata in HMS Table properties.
+  private static final String HIVE_TABLE_PROPERTY_MAX_SIZE = "iceberg.hive.table-property-max-size";
+  private static final String NO_LOCK_EXPECTED_KEY = "expected_parameter_key";
+  private static final String NO_LOCK_EXPECTED_VALUE = "expected_parameter_value";
+  private static final long HIVE_TABLE_PROPERTY_MAX_SIZE_DEFAULT = 32672;
 
   private static final BiMap<String, String> ICEBERG_TO_HMS_TRANSLATION = ImmutableBiMap.of(
       // gc.enabled in Iceberg and external.table.purge in Hive are meant to do the same things but with different names
-      GC_ENABLED, "external.table.purge"
-  );
-
-  private static Cache<String, ReentrantLock> commitLockCache;
-
-  private static synchronized void initTableLevelLockCache(long evictionTimeout) {
-    if (commitLockCache == null) {
-      commitLockCache = Caffeine.newBuilder()
-              .expireAfterAccess(evictionTimeout, TimeUnit.MILLISECONDS)
-              .build();
-    }
-  }
+      GC_ENABLED, "external.table.purge",
+      TableProperties.PARQUET_COMPRESSION, ParquetOutputFormat.COMPRESSION,
+      TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES, ParquetOutputFormat.BLOCK_SIZE);
 
   /**
    * Provides key translation where necessary between Iceberg and HMS props. This translation is needed because some
@@ -126,19 +108,12 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
     return ICEBERG_TO_HMS_TRANSLATION.inverse().getOrDefault(hmsProp, hmsProp);
   }
 
-  private static class WaitingForLockException extends RuntimeException {
-    WaitingForLockException(String message) {
-      super(message);
-    }
-  }
-
   private final String fullName;
+  private final String catalogName;
   private final String database;
   private final String tableName;
   private final Configuration conf;
-  private final long lockAcquireTimeout;
-  private final long lockCheckMinWaitTime;
-  private final long lockCheckMaxWaitTime;
+  private final long maxHiveTablePropertySize;
   private final int metadataRefreshMaxRetries;
   private final FileIO fileIO;
   private final ClientPool<IMetaStoreClient, TException> metaClients;
@@ -149,19 +124,12 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
     this.metaClients = metaClients;
     this.fileIO = fileIO;
     this.fullName = catalogName + "." + database + "." + table;
+    this.catalogName = catalogName;
     this.database = database;
     this.tableName = table;
-    this.lockAcquireTimeout =
-        conf.getLong(HIVE_ACQUIRE_LOCK_TIMEOUT_MS, HIVE_ACQUIRE_LOCK_TIMEOUT_MS_DEFAULT);
-    this.lockCheckMinWaitTime =
-        conf.getLong(HIVE_LOCK_CHECK_MIN_WAIT_MS, HIVE_LOCK_CHECK_MIN_WAIT_MS_DEFAULT);
-    this.lockCheckMaxWaitTime =
-        conf.getLong(HIVE_LOCK_CHECK_MAX_WAIT_MS, HIVE_LOCK_CHECK_MAX_WAIT_MS_DEFAULT);
     this.metadataRefreshMaxRetries =
         conf.getInt(HIVE_ICEBERG_METADATA_REFRESH_MAX_RETRIES, HIVE_ICEBERG_METADATA_REFRESH_MAX_RETRIES_DEFAULT);
-    long tableLevelLockCacheEvictionTimeout =
-            conf.getLong(HIVE_TABLE_LEVEL_LOCK_EVICT_MS, HIVE_TABLE_LEVEL_LOCK_EVICT_MS_DEFAULT);
-    initTableLevelLockCache(tableLevelLockCacheEvictionTimeout);
+    this.maxHiveTablePropertySize = conf.getLong(HIVE_TABLE_PROPERTY_MAX_SIZE, HIVE_TABLE_PROPERTY_MAX_SIZE_DEFAULT);
   }
 
   @Override
@@ -203,34 +171,30 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
   @SuppressWarnings("checkstyle:CyclomaticComplexity")
   @Override
   protected void doCommit(TableMetadata base, TableMetadata metadata) {
-    String newMetadataLocation = base == null && metadata.metadataFileLocation() != null ?
-        metadata.metadataFileLocation() : writeNewMetadata(metadata, currentVersion() + 1);
+    boolean newTable = base == null;
+    String newMetadataLocation = writeNewMetadataIfRequired(newTable, metadata);
     boolean hiveEngineEnabled = hiveEngineEnabled(metadata, conf);
     boolean keepHiveStats = conf.getBoolean(ConfigProperties.KEEP_HIVE_STATS, false);
 
     CommitStatus commitStatus = CommitStatus.FAILURE;
     boolean updateHiveTable = false;
-    Optional<Long> lockId = Optional.empty();
-    // getting a process-level lock per table to avoid concurrent commit attempts to the same table from the same
-    // JVM process, which would result in unnecessary and costly HMS lock acquisition requests
-    ReentrantLock tableLevelMutex = commitLockCache.get(fullName, t -> new ReentrantLock(true));
-    tableLevelMutex.lock();
+
+    HiveLock lock = lockObject(metadata);
     try {
-      lockId = Optional.of(acquireLock());
-      // TODO add lock heart beating for cases where default lock timeout is too low.
+      lock.lock();
 
       Table tbl = loadHmsTable();
 
       if (tbl != null) {
         // If we try to create the table but the metadata location is already set, then we had a concurrent commit
-        if (base == null && tbl.getParameters().get(BaseMetastoreTableOperations.METADATA_LOCATION_PROP) != null) {
+        if (newTable && tbl.getParameters().get(BaseMetastoreTableOperations.METADATA_LOCATION_PROP) != null) {
           throw new AlreadyExistsException("Table already exists: %s.%s", database, tableName);
         }
 
         updateHiveTable = true;
         LOG.debug("Committing existing table: {}", fullName);
       } else {
-        tbl = newHmsTable();
+        tbl = newHmsTable(metadata);
         LOG.debug("Committing new table: {}", fullName);
       }
 
@@ -262,20 +226,45 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
         StatsSetupConst.clearColumnStatsState(tbl.getParameters());
       }
 
+      lock.ensureActive();
       try {
-        persistTable(tbl, updateHiveTable);
+        persistTable(
+            tbl, updateHiveTable, hiveLockEnabled(metadata, conf) ? null : baseMetadataLocation);
+        lock.ensureActive();
+
         commitStatus = CommitStatus.SUCCESS;
+      } catch (LockException le) {
+        throw new CommitStateUnknownException(
+                "Failed to heartbeat for hive lock while " +
+                "committing changes. This can lead to a concurrent commit attempt be able to overwrite this commit. " +
+                "Please check the commit history. If you are running into this issue, try reducing " +
+                "iceberg.hive.lock-heartbeat-interval-ms.",
+                le);
       } catch (org.apache.hadoop.hive.metastore.api.AlreadyExistsException e) {
         throw new AlreadyExistsException(e, "Table already exists: %s.%s", database, tableName);
 
       } catch (InvalidObjectException e) {
         throw new ValidationException(e, "Invalid Hive object for %s.%s", database, tableName);
 
+      } catch (CommitFailedException | CommitStateUnknownException e) {
+        throw e;
+
       } catch (Throwable e) {
+        if (e.getMessage()
+            .contains(
+                "The table has been modified. The parameter value for key '" +
+                    HiveTableOperations.METADATA_LOCATION_PROP +
+                    "' is")) {
+          throw new CommitFailedException(
+              e, "The table %s.%s has been modified concurrently", database, tableName);
+        }
+
         if (e.getMessage() != null && e.getMessage().contains("Table/View 'HIVE_LOCKS' does not exist")) {
-          throw new RuntimeException("Failed to acquire locks from metastore because the underlying metastore " +
-              "table 'HIVE_LOCKS' does not exist. This can occur when using an embedded metastore which does not " +
-              "support transactions. To fix this use an alternative metastore.", e);
+          throw new RuntimeException(
+              "Failed to acquire locks from metastore because the underlying metastore " +
+                  "table 'HIVE_LOCKS' does not exist. This can occur when using an embedded metastore which does not " +
+                  "support transactions. To fix this use an alternative metastore.",
+              e);
         }
 
         LOG.error("Cannot tell if commit to {}.{} succeeded, attempting to reconnect and check.",
@@ -290,25 +279,43 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
             throw new CommitStateUnknownException(e);
         }
       }
-    } catch (TException | UnknownHostException e) {
+    } catch (TException e) {
       throw new RuntimeException(String.format("Metastore operation failed for %s.%s", database, tableName), e);
 
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       throw new RuntimeException("Interrupted during commit", e);
 
+    } catch (LockException e) {
+      throw new CommitFailedException(e);
+
     } finally {
-      cleanupMetadataAndUnlock(commitStatus, newMetadataLocation, lockId, tableLevelMutex);
+      cleanupMetadataAndUnlock(commitStatus, newMetadataLocation, lock);
     }
+
+    LOG.info("Committed to table {} with the new metadata location {}", fullName, newMetadataLocation);
   }
 
   @VisibleForTesting
-  void persistTable(Table hmsTable, boolean updateHiveTable) throws TException, InterruptedException {
+  void persistTable(Table hmsTable, boolean updateHiveTable, String expectedMetadataLocation)
+      throws TException, InterruptedException {
     if (updateHiveTable) {
-      metaClients.run(client -> {
-        MetastoreUtil.alterTable(client, database, tableName, hmsTable);
-        return null;
-      });
+      metaClients.run(
+          client -> {
+            MetastoreUtil.alterTable(
+                client,
+                database,
+                tableName,
+                hmsTable,
+                expectedMetadataLocation != null ?
+                    ImmutableMap.of(
+                        NO_LOCK_EXPECTED_KEY,
+                        METADATA_LOCATION_PROP,
+                        NO_LOCK_EXPECTED_VALUE,
+                        expectedMetadataLocation) :
+                    ImmutableMap.of());
+            return null;
+          });
     } else {
       metaClients.run(client -> {
         client.createTable(hmsTable);
@@ -317,7 +324,8 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
     }
   }
 
-  private Table loadHmsTable() throws TException, InterruptedException {
+  @VisibleForTesting
+  Table loadHmsTable() throws TException, InterruptedException {
     try {
       return metaClients.run(client -> client.getTable(database, tableName));
     } catch (NoSuchObjectException nte) {
@@ -326,12 +334,13 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
     }
   }
 
-  private Table newHmsTable() {
+  private Table newHmsTable(TableMetadata metadata) {
+    Preconditions.checkNotNull(metadata, "'metadata' parameter can't be null");
     final long currentTimeMillis = System.currentTimeMillis();
 
     Table newTable = new Table(tableName,
         database,
-        System.getProperty("user.name"),
+        metadata.property(HiveCatalog.HMS_TABLE_OWNER, HiveHadoopUtil.currentUser()),
         (int) currentTimeMillis / 1000,
         (int) currentTimeMillis / 1000,
         Integer.MAX_VALUE,
@@ -353,11 +362,15 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
         .orElseGet(Maps::newHashMap);
 
     // push all Iceberg table properties into HMS
-    metadata.properties().forEach((key, value) -> {
-      // translate key names between Iceberg and HMS where needed
-      String hmsKey = ICEBERG_TO_HMS_TRANSLATION.getOrDefault(key, key);
-      parameters.put(hmsKey, value);
-    });
+    metadata.properties().entrySet().stream()
+            .filter(entry -> !entry.getKey().equalsIgnoreCase(HiveCatalog.HMS_TABLE_OWNER))
+            .forEach(
+              entry -> {
+                String key = entry.getKey();
+                // translate key names between Iceberg and HMS where needed
+                String hmsKey = ICEBERG_TO_HMS_TRANSLATION.getOrDefault(key, key);
+                parameters.put(hmsKey, entry.getValue());
+              });
     if (metadata.uuid() != null) {
       parameters.put(TableProperties.UUID, metadata.uuid());
     }
@@ -391,7 +404,82 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
       parameters.put(StatsSetupConst.TOTAL_SIZE, summary.get(SnapshotSummary.TOTAL_FILE_SIZE_PROP));
     }
 
+    setSnapshotStats(metadata, parameters);
+    setSchema(metadata, parameters);
+    setPartitionSpec(metadata, parameters);
+    setSortOrder(metadata, parameters);
+
     tbl.setParameters(parameters);
+  }
+
+  @VisibleForTesting
+  void setSnapshotStats(TableMetadata metadata, Map<String, String> parameters) {
+    parameters.remove(TableProperties.CURRENT_SNAPSHOT_ID);
+    parameters.remove(TableProperties.CURRENT_SNAPSHOT_TIMESTAMP);
+    parameters.remove(TableProperties.CURRENT_SNAPSHOT_SUMMARY);
+
+    Snapshot currentSnapshot = metadata.currentSnapshot();
+    if (exposeInHmsProperties() && currentSnapshot != null) {
+      parameters.put(TableProperties.CURRENT_SNAPSHOT_ID, String.valueOf(currentSnapshot.snapshotId()));
+      parameters.put(TableProperties.CURRENT_SNAPSHOT_TIMESTAMP, String.valueOf(currentSnapshot.timestampMillis()));
+      setSnapshotSummary(parameters, currentSnapshot);
+    }
+
+    parameters.put(TableProperties.SNAPSHOT_COUNT, String.valueOf(metadata.snapshots().size()));
+  }
+
+  @VisibleForTesting
+  void setSnapshotSummary(Map<String, String> parameters, Snapshot currentSnapshot) {
+    try {
+      String summary = JsonUtil.mapper().writeValueAsString(currentSnapshot.summary());
+      if (summary.length() <= maxHiveTablePropertySize) {
+        parameters.put(TableProperties.CURRENT_SNAPSHOT_SUMMARY, summary);
+      } else {
+        LOG.warn("Not exposing the current snapshot({}) summary in HMS since it exceeds {} characters",
+                currentSnapshot.snapshotId(), maxHiveTablePropertySize);
+      }
+    } catch (JsonProcessingException e) {
+      LOG.warn("Failed to convert current snapshot({}) summary to a json string", currentSnapshot.snapshotId(), e);
+    }
+  }
+
+  @VisibleForTesting
+  void setSchema(TableMetadata metadata, Map<String, String> parameters) {
+    parameters.remove(TableProperties.CURRENT_SCHEMA);
+    if (exposeInHmsProperties() && metadata.schema() != null) {
+      String schema = SchemaParser.toJson(metadata.schema());
+      setField(parameters, TableProperties.CURRENT_SCHEMA, schema);
+    }
+  }
+
+  @VisibleForTesting
+  void setPartitionSpec(TableMetadata metadata, Map<String, String> parameters) {
+    parameters.remove(TableProperties.DEFAULT_PARTITION_SPEC);
+    if (exposeInHmsProperties() && metadata.spec() != null && metadata.spec().isPartitioned()) {
+      String spec = PartitionSpecParser.toJson(metadata.spec());
+      setField(parameters, TableProperties.DEFAULT_PARTITION_SPEC, spec);
+    }
+  }
+
+  @VisibleForTesting
+  void setSortOrder(TableMetadata metadata, Map<String, String> parameters) {
+    parameters.remove(TableProperties.DEFAULT_SORT_ORDER);
+    if (exposeInHmsProperties() && metadata.sortOrder() != null && metadata.sortOrder().isSorted()) {
+      String sortOrder = SortOrderParser.toJson(metadata.sortOrder());
+      setField(parameters, TableProperties.DEFAULT_SORT_ORDER, sortOrder);
+    }
+  }
+
+  private void setField(Map<String, String> parameters, String key, String value) {
+    if (value.length() <= maxHiveTablePropertySize) {
+      parameters.put(key, value);
+    } else {
+      LOG.warn("Not exposing {} in HMS since it exceeds {} characters", key, maxHiveTablePropertySize);
+    }
+  }
+
+  private boolean exposeInHmsProperties() {
+    return maxHiveTablePropertySize > 0;
   }
 
   private StorageDescriptor storageDescriptor(TableMetadata metadata, boolean hiveEngineEnabled) {
@@ -414,105 +502,28 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
     return storageDescriptor;
   }
 
-  @VisibleForTesting
-  long acquireLock() throws UnknownHostException, TException, InterruptedException {
-    final LockComponent lockComponent = new LockComponent(LockType.EXCL_WRITE, LockLevel.TABLE, database);
-    lockComponent.setTablename(tableName);
-    final LockRequest lockRequest = new LockRequest(Lists.newArrayList(lockComponent),
-        System.getProperty("user.name"),
-        InetAddress.getLocalHost().getHostName());
-    LockResponse lockResponse = metaClients.run(client -> client.lock(lockRequest));
-    AtomicReference<LockState> state = new AtomicReference<>(lockResponse.getState());
-    long lockId = lockResponse.getLockid();
-
-    final long start = System.currentTimeMillis();
-    long duration = 0;
-    boolean timeout = false;
-
-    try {
-      if (state.get().equals(LockState.WAITING)) {
-        // Retry count is the typical "upper bound of retries" for Tasks.run() function. In fact, the maximum number of
-        // attempts the Tasks.run() would try is `retries + 1`. Here, for checking locks, we use timeout as the
-        // upper bound of retries. So it is just reasonable to set a large retry count. However, if we set
-        // Integer.MAX_VALUE, the above logic of `retries + 1` would overflow into Integer.MIN_VALUE. Hence,
-        // the retry is set conservatively as `Integer.MAX_VALUE - 100` so it doesn't hit any boundary issues.
-        Tasks.foreach(lockId)
-            .retry(Integer.MAX_VALUE - 100)
-            .exponentialBackoff(
-                lockCheckMinWaitTime,
-                lockCheckMaxWaitTime,
-                lockAcquireTimeout,
-                1.5)
-            .throwFailureWhenFinished()
-            .onlyRetryOn(WaitingForLockException.class)
-            .run(id -> {
-              try {
-                LockResponse response = metaClients.run(client -> client.checkLock(id));
-                LockState newState = response.getState();
-                state.set(newState);
-                if (newState.equals(LockState.WAITING)) {
-                  throw new WaitingForLockException("Waiting for lock.");
-                }
-              } catch (InterruptedException e) {
-                Thread.interrupted(); // Clear the interrupt status flag
-                LOG.warn("Interrupted while waiting for lock.", e);
-              }
-            }, TException.class);
-      }
-    } catch (WaitingForLockException waitingForLockException) {
-      timeout = true;
-      duration = System.currentTimeMillis() - start;
-    } finally {
-      if (!state.get().equals(LockState.ACQUIRED)) {
-        unlock(Optional.of(lockId));
-      }
-    }
-
-    // timeout and do not have lock acquired
-    if (timeout && !state.get().equals(LockState.ACQUIRED)) {
-      throw new CommitFailedException("Timed out after %s ms waiting for lock on %s.%s",
-          duration, database, tableName);
-    }
-
-    if (!state.get().equals(LockState.ACQUIRED)) {
-      throw new CommitFailedException("Could not acquire the lock on %s.%s, " +
-          "lock request ended in state %s", database, tableName, state);
-    }
-    return lockId;
-  }
-
-  private void cleanupMetadataAndUnlock(CommitStatus commitStatus, String metadataLocation, Optional<Long> lockId,
-      ReentrantLock tableLevelMutex) {
+  private void cleanupMetadataAndUnlock(CommitStatus commitStatus, String metadataLocation,
+      HiveLock lock) {
     try {
       if (commitStatus == CommitStatus.FAILURE) {
         // If we are sure the commit failed, clean up the uncommitted metadata file
         io().deleteFile(metadataLocation);
       }
     } catch (RuntimeException e) {
-      LOG.error("Fail to cleanup metadata file at {}", metadataLocation, e);
-      throw e;
+      LOG.error("Failed to cleanup metadata file at {}", metadataLocation, e);
     } finally {
-      unlock(lockId);
-      tableLevelMutex.unlock();
+      doUnlock(lock);
     }
   }
 
-  private void unlock(Optional<Long> lockId) {
-    if (lockId.isPresent()) {
+  void doUnlock(HiveLock lock) {
+    if (lock != null) {
       try {
-        doUnlock(lockId.get());
+        lock.unlock();
       } catch (Exception e) {
         LOG.warn("Failed to unlock {}.{}", database, tableName, e);
       }
     }
-  }
-
-  @VisibleForTesting
-  void doUnlock(long lockId) throws TException, InterruptedException {
-    metaClients.run(client -> {
-      client.unlock(lockId);
-      return null;
-    });
   }
 
   static void validateTableIsIceberg(Table table, String fullName) {
@@ -541,6 +552,43 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
       return metadata.propertyAsBoolean(TableProperties.ENGINE_HIVE_ENABLED, false);
     }
 
-    return conf.getBoolean(ConfigProperties.ENGINE_HIVE_ENABLED, TableProperties.ENGINE_HIVE_ENABLED_DEFAULT);
+    return conf.getBoolean(
+        ConfigProperties.ENGINE_HIVE_ENABLED, TableProperties.ENGINE_HIVE_ENABLED_DEFAULT);
+  }
+
+  /**
+   * Returns if the hive locking should be enabled on the table, or not.
+   *
+   * <p>The decision is made like this:
+   *
+   * <ol>
+   *   <li>Table property value {@link TableProperties#HIVE_LOCK_ENABLED}
+   *   <li>If the table property is not set then check the hive-site.xml property value {@link
+   *       ConfigProperties#LOCK_HIVE_ENABLED}
+   *   <li>If none of the above is enabled then use the default value {@link
+   *       TableProperties#HIVE_LOCK_ENABLED_DEFAULT}
+   * </ol>
+   *
+   * @param metadata Table metadata to use
+   * @param conf The hive configuration to use
+   * @return if the hive engine related values should be enabled or not
+   */
+  private static boolean hiveLockEnabled(TableMetadata metadata, Configuration conf) {
+    if (metadata.properties().get(TableProperties.HIVE_LOCK_ENABLED) != null) {
+      // We know that the property is set, so default value will not be used,
+      return metadata.propertyAsBoolean(TableProperties.HIVE_LOCK_ENABLED, false);
+    }
+
+    return conf.getBoolean(
+        ConfigProperties.LOCK_HIVE_ENABLED, TableProperties.HIVE_LOCK_ENABLED_DEFAULT);
+  }
+
+  @VisibleForTesting
+  HiveLock lockObject(TableMetadata metadata) {
+    if (hiveLockEnabled(metadata, conf)) {
+      return new MetastoreLock(conf, metaClients, catalogName, database, tableName);
+    } else {
+      return new NoLock();
+    }
   }
 }

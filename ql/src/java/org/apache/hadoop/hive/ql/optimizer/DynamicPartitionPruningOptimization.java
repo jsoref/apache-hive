@@ -28,7 +28,6 @@ import java.util.Stack;
 
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
-import org.apache.hadoop.hive.metastore.utils.MetaStoreUtils;
 import org.apache.hadoop.hive.ql.exec.ColumnInfo;
 import org.apache.hadoop.hive.ql.exec.FilterOperator;
 import org.apache.hadoop.hive.ql.exec.FunctionRegistry;
@@ -73,16 +72,20 @@ import org.apache.hadoop.hive.ql.plan.PlanUtils;
 import org.apache.hadoop.hive.ql.plan.ReduceSinkDesc;
 import org.apache.hadoop.hive.ql.plan.SelectDesc;
 import org.apache.hadoop.hive.ql.plan.TableDesc;
+import org.apache.hadoop.hive.ql.stats.StatsUtils;
 import org.apache.hadoop.hive.ql.udf.generic.GenericUDAFBloomFilter.GenericUDAFBloomFilterEvaluator;
 import org.apache.hadoop.hive.ql.udf.generic.GenericUDAFEvaluator.Mode;
 import org.apache.hadoop.hive.ql.udf.generic.GenericUDFIn;
 import org.apache.hadoop.hive.ql.util.NullOrdering;
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
+
+import static org.apache.hadoop.hive.ql.exec.FunctionRegistry.BLOOM_FILTER_FUNCTION;
 
 /**
  * This optimization looks for expressions of the kind "x IN (RS[n])". If such
@@ -299,8 +302,8 @@ public class DynamicPartitionPruningOptimization implements SemanticNodeProcesso
     boolean disableSemiJoin = false;
     if (conf.getBoolVar(HiveConf.ConfVars.HIVE_DISABLE_UNSAFE_EXTERNALTABLE_OPERATIONS)) {
       // We already have the TableScan for one side of the join. Check this now.
-      if (MetaStoreUtils.isExternalTable(ts.getConf().getTableMetadata().getTTable())) {
-        LOG.debug("Disabling semijoin optimzation on {} since it is an external table.",
+      if (!StatsUtils.checkCanProvideStats(new Table(ts.getConf().getTableMetadata().getTTable()))) {
+        LOG.debug("Disabling semijoin optimzation on {} since it is an external table and also could not provide statistics.",
             ts.getConf().getTableMetadata().getFullyQualifiedName());
         disableSemiJoin = true;
       } else {
@@ -315,8 +318,9 @@ public class DynamicPartitionPruningOptimization implements SemanticNodeProcesso
           if (columnOrigin != null && columnOrigin.op instanceof TableScanOperator) {
             // Join key origin has been traced to a table column. Check if the table is external.
             TableScanOperator joinKeyTs = (TableScanOperator) columnOrigin.op;
-            if (MetaStoreUtils.isExternalTable(joinKeyTs.getConf().getTableMetadata().getTTable())) {
-              LOG.debug("Join key {} is from {} which is an external table. Disabling semijoin optimization.",
+            if (!StatsUtils.checkCanProvideStats(new Table(joinKeyTs.getConf().getTableMetadata().getTTable()))) {
+              LOG.debug("Join key {} is from {} which is an external table and also could not provide statistics. " +
+                      "Disabling semijoin optimization.",
                   columnOrigin.col,
                   joinKeyTs.getConf().getTableMetadata().getFullyQualifiedName());
               disableSemiJoin = true;
@@ -636,8 +640,10 @@ public class DynamicPartitionPruningOptimization implements SemanticNodeProcesso
       AggregationDesc max = new AggregationDesc("max",
               FunctionRegistry.getGenericUDAFEvaluator("max", aggFnOIs, false, false),
               params, false, Mode.PARTIAL1);
-      AggregationDesc bloomFilter = new AggregationDesc("bloom_filter",
-              FunctionRegistry.getGenericUDAFEvaluator("bloom_filter", aggFnOIs, false, false),
+      // we don't add numThreads here since PARTIAL1 mode is for VectorUDAFBloomFilter which does
+      // not support numThreads parameter
+      AggregationDesc bloomFilter = new AggregationDesc(BLOOM_FILTER_FUNCTION,
+              FunctionRegistry.getGenericUDAFEvaluator(BLOOM_FILTER_FUNCTION, aggFnOIs, false, false),
               params, false, Mode.PARTIAL1);
       GenericUDAFBloomFilterEvaluator bloomFilterEval =
           (GenericUDAFBloomFilterEvaluator) bloomFilter.getGenericUDAFEvaluator();
@@ -737,6 +743,9 @@ public class DynamicPartitionPruningOptimization implements SemanticNodeProcesso
                       rsValueCols.get(2).getTypeInfo(),
                       Utilities.ReduceField.VALUE + "." +
                               gbOutputNames.get(2), "", false));
+      int numThreads = parseContext.getConf().getIntVar(HiveConf.ConfVars.TEZ_BLOOM_FILTER_MERGE_THREADS);
+      TypeInfo intTypeInfo = TypeInfoFactory.getPrimitiveTypeInfoFromJavaPrimitive(Integer.TYPE);
+      bloomFilterFinalParams.add(new ExprNodeConstantDesc(intTypeInfo, numThreads));
 
       AggregationDesc min = new AggregationDesc("min",
               FunctionRegistry.getGenericUDAFEvaluator("min", minFinalFnOIs,
@@ -746,8 +755,8 @@ public class DynamicPartitionPruningOptimization implements SemanticNodeProcesso
               FunctionRegistry.getGenericUDAFEvaluator("max", maxFinalFnOIs,
                       false, false),
               maxFinalParams, false, Mode.FINAL);
-      AggregationDesc bloomFilter = new AggregationDesc("bloom_filter",
-              FunctionRegistry.getGenericUDAFEvaluator("bloom_filter", bloomFilterFinalFnOIs,
+      AggregationDesc bloomFilter = new AggregationDesc(BLOOM_FILTER_FUNCTION,
+              FunctionRegistry.getGenericUDAFEvaluator(BLOOM_FILTER_FUNCTION, bloomFilterFinalFnOIs,
                       false, false),
               bloomFilterFinalParams, false, Mode.FINAL);
       GenericUDAFBloomFilterEvaluator bloomFilterEval = (GenericUDAFBloomFilterEvaluator) bloomFilter.getGenericUDAFEvaluator();
@@ -825,7 +834,7 @@ public class DynamicPartitionPruningOptimization implements SemanticNodeProcesso
     List<String> dynamicValueIDs = new ArrayList<String>();
     dynamicValueIDs.add(keyBaseAlias + "_min");
     dynamicValueIDs.add(keyBaseAlias + "_max");
-    dynamicValueIDs.add(keyBaseAlias + "_bloom_filter");
+    dynamicValueIDs.add(keyBaseAlias + "_" + BLOOM_FILTER_FUNCTION);
 
     runtimeValuesInfo.setTableDesc(rsFinalTableDesc);
     runtimeValuesInfo.setDynamicValueIDs(dynamicValueIDs);

@@ -20,12 +20,12 @@ package org.apache.hadoop.hive.ql.ddl.table.create;
 
 
 import java.io.Serializable;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.fs.Path;
@@ -36,6 +36,7 @@ import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.ColumnStatistics;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsDesc;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
+import org.apache.hadoop.hive.metastore.api.ObjectDictionary;
 import org.apache.hadoop.hive.metastore.api.Order;
 import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 import org.apache.hadoop.hive.metastore.api.SQLCheckConstraint;
@@ -56,8 +57,6 @@ import org.apache.hadoop.hive.ql.metadata.HiveStorageHandler;
 import org.apache.hadoop.hive.ql.metadata.Table;
 import org.apache.hadoop.hive.ql.parse.BaseSemanticAnalyzer;
 import org.apache.hadoop.hive.ql.parse.ParseUtils;
-import org.apache.hadoop.hive.ql.parse.PartitionTransform;
-import org.apache.hadoop.hive.ql.parse.TransformSpec;
 import org.apache.hadoop.hive.ql.parse.ReplicationSpec;
 import org.apache.hadoop.hive.ql.parse.SemanticException;
 import org.apache.hadoop.hive.ql.plan.Explain;
@@ -65,13 +64,14 @@ import org.apache.hadoop.hive.ql.plan.FileSinkDesc;
 import org.apache.hadoop.hive.ql.plan.PlanUtils;
 import org.apache.hadoop.hive.ql.plan.ValidationUtility;
 import org.apache.hadoop.hive.ql.plan.Explain.Level;
-import org.apache.hadoop.hive.ql.session.SessionStateUtil;
 import org.apache.hadoop.hive.serde.serdeConstants;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
 import org.apache.hadoop.mapred.OutputFormat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import static org.apache.hadoop.hive.ql.ddl.DDLUtils.setColumnsAndStorePartitionTransformSpecOfTable;
 
 /**
  * DDL task description for CREATE TABLE commands.
@@ -518,10 +518,9 @@ public class CreateTableDesc implements DDLDesc, Serializable {
 
   @Explain(displayName = "table properties")
   public Map<String, String> getTblPropsExplain() { // only for displaying plan
-    HashMap<String, String> copy = new HashMap<>(tblProps);
-    copy.remove(hive_metastoreConstants.TABLE_IS_CTAS);
-    copy.remove(hive_metastoreConstants.TABLE_BUCKETING_VERSION);
-    return copy;
+    return PlanUtils.getPropertiesForExplain(tblProps,
+            hive_metastoreConstants.TABLE_IS_CTAS,
+            hive_metastoreConstants.TABLE_BUCKETING_VERSION);
   }
 
   /**
@@ -822,25 +821,7 @@ public class CreateTableDesc implements DDLDesc, Serializable {
       }
     }
 
-    Optional<List<FieldSchema>> cols = Optional.ofNullable(getCols());
-    Optional<List<FieldSchema>> partCols = Optional.ofNullable(getPartCols());
-
-    if (storageHandler != null && storageHandler.alwaysUnpartitioned()) {
-      tbl.getSd().setCols(new ArrayList<>());
-      cols.ifPresent(c -> tbl.getSd().getCols().addAll(c));
-      if (partCols.isPresent() && !partCols.get().isEmpty()) {
-        // Add the partition columns to the normal columns and save the transform to the session state
-        tbl.getSd().getCols().addAll(partCols.get());
-        List<TransformSpec> spec = PartitionTransform.getPartitionTransformSpec(partCols.get());
-        if (!SessionStateUtil.addResource(conf, hive_metastoreConstants.PARTITION_TRANSFORM_SPEC, spec)) {
-          throw new HiveException("Query state attached to Session state must be not null. " +
-                                      "Partition transform metadata cannot be saved.");
-        }
-      }
-    } else {
-      cols.ifPresent(c -> tbl.setFields(c));
-      partCols.ifPresent(c -> tbl.setPartCols(c));
-    }
+    setColumnsAndStorePartitionTransformSpecOfTable(getCols(), getPartCols(), conf, tbl);
 
     if (getBucketCols() != null) {
       tbl.setBucketCols(getBucketCols());
@@ -943,14 +924,25 @@ public class CreateTableDesc implements DDLDesc, Serializable {
     // When replicating the statistics for a table will be obtained from the source. Do not
     // reset it on replica.
     if (replicationSpec == null || !replicationSpec.isInReplicationScope()) {
-      if (!this.isCTAS && (tbl.getPath() == null || (!isExternal() && tbl.isEmpty()))) {
-        if (!tbl.isPartitioned() && conf.getBoolVar(HiveConf.ConfVars.HIVESTATSAUTOGATHER)) {
-          StatsSetupConst.setStatsStateForCreateTable(tbl.getTTable().getParameters(),
-                  MetaStoreUtils.getColumnNames(tbl.getCols()), StatsSetupConst.TRUE);
-        }
-      } else {
-        StatsSetupConst.setStatsStateForCreateTable(tbl.getTTable().getParameters(), null,
-                StatsSetupConst.FALSE);
+      // Remove COLUMN_STATS_ACCURATE=true from table's parameter, let the HMS determine if
+      // there is need to add column stats dependent on the table's location.
+      StatsSetupConst.setStatsStateForCreateTable(tbl.getTTable().getParameters(), null,
+          StatsSetupConst.FALSE);
+      if (!this.isCTAS && !tbl.isPartitioned() && !tbl.isTemporary() &&
+          conf.getBoolVar(HiveConf.ConfVars.HIVESTATSAUTOGATHER)) {
+        // Put the flag into the dictionary in order not to pollute the table,
+        // ObjectDictionary is meant to convey repeatitive messages.
+        ObjectDictionary dictionary = tbl.getTTable().isSetDictionary() ?
+            tbl.getTTable().getDictionary() : new ObjectDictionary();
+        List<ByteBuffer> buffers = new ArrayList<>();
+        String statsSetup = StatsSetupConst.ColumnStatsSetup.getStatsSetupAsString(true,
+            // Ignore all Iceberg leftover files when storageHandler.isTableIdentifierSupported() is true,
+            // as the method is only enabled in Iceberg currently.
+            storageHandler != null && storageHandler.isTableMetaRefSupported(),
+            MetaStoreUtils.getColumnNames(tbl.getCols()));
+        buffers.add(ByteBuffer.wrap(statsSetup.getBytes(StandardCharsets.UTF_8)));
+        dictionary.putToValues(StatsSetupConst.STATS_FOR_CREATE_TABLE, buffers);
+        tbl.getTTable().setDictionary(dictionary);
       }
     }
 

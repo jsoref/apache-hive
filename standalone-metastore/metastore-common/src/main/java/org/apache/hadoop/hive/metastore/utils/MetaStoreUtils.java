@@ -25,6 +25,7 @@ import java.security.AccessController;
 import java.security.PrivilegedAction;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -83,6 +84,14 @@ public class MetaStoreUtils {
       val.setTimeZone(TimeZone.getTimeZone("UTC"));
       return val;
     }
+  };
+  public static final ThreadLocal<DateTimeFormatter> PARTITION_TIMESTAMP_FORMAT =
+      new ThreadLocal<DateTimeFormatter>() {
+        @Override
+        protected DateTimeFormatter initialValue() {
+          return DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").
+              withZone(TimeZone.getTimeZone("UTC").toZoneId());
+        }
   };
   // Indicates a type was derived from the deserializer rather than Hive's metadata.
   public static final String TYPE_FROM_DESERIALIZER = "<derived from deserializer>";
@@ -265,7 +274,7 @@ public class MetaStoreUtils {
     return dbParameters != null && ReplConst.TRUE.equalsIgnoreCase(dbParameters.get(ReplConst.REPL_INCOMPATIBLE));
   }
 
-  public static boolean isDbBeingFailedOver(Database db) {
+  public static boolean isDbBeingPlannedFailedOver(Database db) {
     assert (db != null);
     Map<String, String> dbParameters = db.getParameters();
     if (dbParameters == null) {
@@ -276,7 +285,7 @@ public class MetaStoreUtils {
             || FailoverEndpoint.TARGET.toString().equalsIgnoreCase(dbFailoverEndPoint);
   }
 
-  public static boolean isDbBeingFailedOverAtEndpoint(Database db, FailoverEndpoint endPoint) {
+  public static boolean isDbBeingPlannedFailedOverAtEndpoint(Database db, FailoverEndpoint endPoint) {
     if (db == null) {
       return false;
     }
@@ -301,7 +310,7 @@ public class MetaStoreUtils {
     assert (db != null);
     if (isBackgroundThreadsEnabledForRepl(db)) {
       return false;
-    } else if (isDbBeingFailedOver(db)) {
+    } else if (isDbBeingPlannedFailedOver(db)) {
       LOG.info("Skipping all the tables which belong to database: {} as it is being failed over", db.getName());
       return true;
     } else if (isTargetOfReplication(db)) {
@@ -1143,15 +1152,30 @@ public class MetaStoreUtils {
   /**
    * Because TABLE_NO_AUTO_COMPACT was originally assumed to be NO_AUTO_COMPACT and then was moved
    * to no_auto_compact, we need to check it in both cases.
+   * Check the database level no_auto_compact , if present it is given priority else table level no_auto_compact is considered.
    */
-  public static boolean isNoAutoCompactSet(Map<String, String> parameters) {
-    String noAutoCompact =
-            parameters.get(hive_metastoreConstants.TABLE_NO_AUTO_COMPACT);
-    if (noAutoCompact == null) {
-      noAutoCompact =
-              parameters.get(hive_metastoreConstants.TABLE_NO_AUTO_COMPACT.toUpperCase());
+  public static boolean isNoAutoCompactSet(Map<String, String> dbParameters, Map<String, String> tblParameters) {
+    String dbNoAutoCompact = getNoAutoCompact(dbParameters);
+    if (dbNoAutoCompact == null) {
+      LOG.debug("Using table configuration '" + hive_metastoreConstants.NO_AUTO_COMPACT + "' for compaction");
+      String noAutoCompact = getNoAutoCompact(tblParameters);
+      return Boolean.parseBoolean(noAutoCompact);
     }
-    return noAutoCompact != null && noAutoCompact.equalsIgnoreCase("true");
+    LOG.debug("Using database configuration '" + hive_metastoreConstants.NO_AUTO_COMPACT + "' for compaction");
+    return Boolean.parseBoolean(dbNoAutoCompact);
+  }
+
+  /**
+   * Get no_auto_compact property by checking in both lower and upper cases
+   * @param parameters
+   * @return true/false if set, null if there is no NO_AUTO_COMPACT set in database level config,
+   */
+  public static String getNoAutoCompact(Map<String, String> parameters) {
+    String noAutoCompact = parameters.get(hive_metastoreConstants.NO_AUTO_COMPACT);
+    if (noAutoCompact == null) {
+      return parameters.get(hive_metastoreConstants.NO_AUTO_COMPACT.toUpperCase());
+    }
+    return noAutoCompact;
   }
 
   public static String getHostFromId(String id) {

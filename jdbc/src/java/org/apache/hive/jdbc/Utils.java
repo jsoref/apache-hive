@@ -18,6 +18,7 @@
 
 package org.apache.hive.jdbc;
 
+import java.io.IOException;
 import java.net.InetAddress;
 import java.net.URI;
 import java.net.UnknownHostException;
@@ -31,6 +32,7 @@ import java.util.Properties;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hive.service.cli.HiveSQLException;
 import org.apache.hive.service.rpc.thrift.TStatus;
@@ -99,6 +101,7 @@ public class Utils {
     public static final String AUTH_PASSWD = "password";
     public static final String AUTH_KERBEROS_AUTH_TYPE = "kerberosAuthType";
     public static final String AUTH_KERBEROS_AUTH_TYPE_FROM_SUBJECT = "fromSubject";
+    public static final String AUTH_KERBEROS_ENABLE_CANONICAL_HOSTNAME_CHECK = "kerberosEnableCanonicalHostnameCheck";
     public static final String AUTH_TYPE_JWT = "jwt";
     public static final String AUTH_TYPE_JWT_KEY = "jwt";
     public static final String AUTH_JWT_ENV = "JWT";
@@ -156,6 +159,8 @@ public class Utils {
     static final String DEFAULT_COOKIE_NAMES_HS2 = "hive.server2.auth";
     // The http header prefix for additional headers which have to be appended to the request
     static final String HTTP_HEADER_PREFIX = "http.header.";
+    // Request tracking
+    static final String JDBC_PARAM_REQUEST_TRACK = "requestTrack";
     // Set the fetchSize
     static final String FETCH_SIZE = "fetchSize";
     static final String INIT_FILE = "initFile";
@@ -165,6 +170,7 @@ public class Utils {
     // Create external purge table by default
     static final String CREATE_TABLE_AS_EXTERNAL = "hiveCreateAsExternalLegacy";
     public static final String SOCKET_TIMEOUT = "socketTimeout";
+    static final String THRIFT_CLIENT_MAX_MESSAGE_SIZE = "thrift.client.max.message.size";
 
     // We support ways to specify application name modeled after some existing DBs, since
     // there's no standard approach.
@@ -183,6 +189,8 @@ public class Utils {
     static final String SUNX509_ALGORITHM_STRING = "SunX509";
     static final String SUNJSSE_ALGORITHM_STRING = "SunJSSE";
    // --------------- End 2 way ssl options ----------------------------
+
+    static final String SSL_STORE_PASSWORD_PATH = "storePasswordPath";
 
     private static final String HIVE_VAR_PREFIX = "hivevar:";
     public static final String HIVE_CONF_PREFIX = "hiveconf:";
@@ -799,4 +807,39 @@ public class Utils {
     }
   }
 
+  /**
+   * Method to get the password from the credential provider
+   * @param providerPath provider path
+   * @param key alias name
+   * @return password
+   */
+  private static String getPasswordFromCredentialProvider(String providerPath, String key) {
+    try {
+      if (providerPath != null) {
+        Configuration conf = new Configuration();
+        conf.set("hadoop.security.credential.provider.path", providerPath);
+        char[] password = conf.getPassword(key);
+        if (password != null) {
+          return new String(password);
+        }
+      }
+    } catch(IOException exception) {
+      LOG.warn("Could not retrieve password for " + key, exception);
+    }
+    return null;
+  }
+
+  /**
+   * Method to get the password from the configuration map if available. Otherwise, get it from the credential provider
+   * @param confMap configuration map
+   * @param key param
+   * @return password
+   */
+  public static String getPassword(Map<String, String> confMap, String key) {
+    String password = confMap.get(key);
+    if (password == null) {
+      password = getPasswordFromCredentialProvider(confMap.get(JdbcConnectionParams.SSL_STORE_PASSWORD_PATH), key);
+    }
+    return password;
+  }
 }
